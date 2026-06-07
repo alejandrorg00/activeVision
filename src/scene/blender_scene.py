@@ -18,22 +18,20 @@ def clear_scene() -> None:
 
 def setup_render_settings(
     resolution: int = 128,
-    samples: int = 64,
+    samples: int = 32,
     engine: str = "CYCLES",
     use_gpu: bool = True,
     background_color=(0.5, 0.5, 0.5, 1.0),
     background_strength: float = 1.0,
 ) -> bpy.types.Scene:
-    """Configure render settings for an offline RGB render."""
+    """Configure Blender for offline RGB rendering."""
     scene = bpy.context.scene
-
     scene.render.engine = engine
 
     if engine == "CYCLES":
         scene.cycles.samples = int(samples)
         scene.cycles.use_denoising = True
-        if use_gpu:
-            scene.cycles.device = "GPU"
+        scene.cycles.device = "GPU" if use_gpu else "CPU"
 
     scene.render.resolution_x = int(resolution)
     scene.render.resolution_y = int(resolution)
@@ -55,14 +53,14 @@ def setup_render_settings(
 def import_largest_mesh_from_blend(object_path: str | Path) -> bpy.types.Object:
     """
     Import all objects from a .blend file and return the largest mesh.
-    This is useful for object files containing lights, cameras, empties, etc.
+    Useful when the .blend contains cameras, lights, empties, etc.
     """
     object_path = Path(object_path)
 
     before_names = set(bpy.data.objects.keys())
 
     with bpy.data.libraries.load(str(object_path), link=False) as (data_from, data_to):
-        data_to.objects = [name for name in data_from.objects]
+        data_to.objects = list(data_from.objects)
 
     for obj in data_to.objects:
         if obj is not None:
@@ -90,17 +88,12 @@ def import_largest_mesh_from_blend(object_path: str | Path) -> bpy.types.Object:
 
 def center_and_scale_object(
     obj: bpy.types.Object,
-    target_size: float = 0.9,
+    target_size: float = 1.2,
     apply_transform: bool = True,
 ) -> bpy.types.Object:
-    """
-    Center object at origin and scale it to fit approximately inside a target box.
-    """
-    bpy.context.view_layer.objects.active = obj
-    obj.select_set(True)
-
-    # Compute world-space bounding box
+    """Center the object at the world origin and scale it to a target size."""
     bpy.context.view_layer.update()
+
     bbox_world = [obj.matrix_world @ Vector(corner) for corner in obj.bound_box]
 
     min_corner = Vector((
@@ -108,6 +101,7 @@ def center_and_scale_object(
         min(v.y for v in bbox_world),
         min(v.z for v in bbox_world),
     ))
+
     max_corner = Vector((
         max(v.x for v in bbox_world),
         max(v.y for v in bbox_world),
@@ -115,15 +109,17 @@ def center_and_scale_object(
     ))
 
     center = 0.5 * (min_corner + max_corner)
-    size = max(max_corner - min_corner)
+    extent = max_corner - min_corner
+    max_dim = max(extent.x, extent.y, extent.z)
 
     obj.location -= center
 
-    if size > 0:
-        scale = float(target_size) / float(size)
-        obj.scale *= scale
+    if max_dim > 0:
+        obj.scale *= float(target_size) / float(max_dim)
 
     if apply_transform:
+        bpy.context.view_layer.objects.active = obj
+        obj.select_set(True)
         bpy.ops.object.transform_apply(location=True, rotation=False, scale=True)
 
     return obj
@@ -135,7 +131,7 @@ def rotate_object(
     elevation_deg: float = 0.0,
 ) -> bpy.types.Object:
     """Apply a simple object orientation."""
-    obj.rotation_euler[1] += math.radians(float(azimuth_deg))
+    obj.rotation_euler[2] += math.radians(float(azimuth_deg))
     obj.rotation_euler[0] += math.radians(float(elevation_deg))
 
     bpy.context.view_layer.objects.active = obj
@@ -146,10 +142,9 @@ def rotate_object(
 
 
 def add_area_light(
-    location=(0.0, 0.0, 5.0),
-    rotation=(0.0, 0.0, 0.0),
+    location=(2.5, -2.5, 4.0),
     size: float = 5.0,
-    strength: float = 300.0,
+    strength: float = 2000.0,
     name: str = "main_area_light",
 ) -> bpy.types.Object:
     """Add a large area light."""
@@ -159,30 +154,38 @@ def add_area_light(
 
     light = bpy.data.objects.new(name, light_data)
     bpy.context.scene.collection.objects.link(light)
-
     light.location = location
-    light.rotation_euler = rotation
 
     return light
 
 
 def create_camera(
-    location=(0.0, 0.0, 2.5),
+    location=(0.0, -4.0, 1.8),
     focal_length: float = 50.0,
     sensor_width_mm: float = 32.0,
     name: str = "render_camera",
 ) -> bpy.types.Object:
-    """Create a camera looking along its local -Z axis."""
+    """Create a Blender camera."""
     cam_data = bpy.data.cameras.new(name)
     cam = bpy.data.objects.new(name, cam_data)
     bpy.context.scene.collection.objects.link(cam)
 
     cam.location = location
-    cam.rotation_mode = "QUATERNION"
-
     cam.data.lens = float(focal_length)
     cam.data.sensor_width = float(sensor_width_mm)
+    cam.rotation_mode = "QUATERNION"
 
     bpy.context.scene.camera = cam
 
     return cam
+
+
+def look_at(
+    obj: bpy.types.Object,
+    target=(0.0, 0.0, 0.0),
+) -> None:
+    """Rotate an object so its local -Z axis points to target."""
+    target = Vector(target)
+    direction = target - obj.location
+    obj.rotation_mode = "QUATERNION"
+    obj.rotation_quaternion = direction.to_track_quat("-Z", "Y")

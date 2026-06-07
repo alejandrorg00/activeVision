@@ -9,9 +9,6 @@ from mathutils import Quaternion
 
 @dataclass
 class CameraMotionState:
-    base_pan: float = 0.0
-    base_tilt: float = 0.0
-
     drift_pan: float = 0.0
     drift_tilt: float = 0.0
 
@@ -25,27 +22,29 @@ class CameraMotionState:
 
 class MicrosaccadeCameraController:
     """
-    Offline camera motion controller.
+    Offline camera controller.
 
-    It applies:
-    - slow random drift
+    Adds three components:
+    - slow drift
     - discrete microsaccades
-    - optional frame-wise jitter
+    - frame-wise jitter
 
-    The camera is rotated around its own position.
+    The perturbation is applied around a fixed base camera orientation.
     """
 
     def __init__(
         self,
         camera,
+        base_rotation_quaternion,
         drift_sigma_deg=(0.01, 0.01),
-        microsaccade_rate_hz: float = 10.0,
-        microsaccade_amp_deg=(0.2, 1.0),
+        microsaccade_rate_hz: float = 5.0,
+        microsaccade_amp_deg=(0.05, 0.30),
         microsaccade_dur_ms=(10, 30),
-        jitter_sigma_deg=(0.0, 0.0),
+        jitter_sigma_deg=(0.005, 0.005),
         seed: int | None = None,
     ):
         self.camera = camera
+        self.base_rotation = base_rotation_quaternion.copy()
         self.state = CameraMotionState()
 
         self.drift_sigma_pan = math.radians(float(drift_sigma_deg[0]))
@@ -61,36 +60,24 @@ class MicrosaccadeCameraController:
         self.rng = np.random.default_rng(seed)
 
     def update(self, dt: float) -> dict:
-        """
-        Advance motion by one frame and apply camera rotation.
-
-        Returns metadata for saving.
-        """
         s = self.state
 
-        # Slow drift
+        # Slow accumulated drift
         s.drift_pan += float(self.rng.normal(0.0, self.drift_sigma_pan))
         s.drift_tilt += float(self.rng.normal(0.0, self.drift_sigma_tilt))
 
-        # Start a microsaccade with probability rate * dt
+        # Start microsaccade
         if not s.ms_active:
             if self.ms_rate_hz > 0 and self.rng.random() < self.ms_rate_hz * dt:
-                dur_ms = int(
-                    self.rng.integers(
-                        int(self.ms_dur_ms[0]),
-                        int(self.ms_dur_ms[1]) + 1,
-                    )
-                )
-                frames = max(1, int(round((dur_ms / 1000.0) / dt)))
+                dur_ms = float(self.rng.uniform(self.ms_dur_ms[0], self.ms_dur_ms[1]))
+                n_frames = max(1, int(round((dur_ms / 1000.0) / dt)))
 
-                amp = math.radians(
-                    float(self.rng.uniform(self.ms_amp_deg[0], self.ms_amp_deg[1]))
-                )
+                amp = math.radians(float(self.rng.uniform(self.ms_amp_deg[0], self.ms_amp_deg[1])))
                 phi = float(self.rng.uniform(0.0, 2.0 * math.pi))
 
-                s.ms_pan_step = (amp * math.cos(phi)) / frames
-                s.ms_tilt_step = (amp * math.sin(phi)) / frames
-                s.ms_frames_left = frames
+                s.ms_pan_step = amp * math.cos(phi) / n_frames
+                s.ms_tilt_step = amp * math.sin(phi) / n_frames
+                s.ms_frames_left = n_frames
                 s.ms_active = True
 
         # Continue microsaccade
@@ -104,18 +91,18 @@ class MicrosaccadeCameraController:
                 s.ms_pan_step = 0.0
                 s.ms_tilt_step = 0.0
 
-        # Optional per-frame jitter
+        # White jitter
         jitter_pan = float(self.rng.normal(0.0, self.jitter_sigma_pan))
         jitter_tilt = float(self.rng.normal(0.0, self.jitter_sigma_tilt))
 
-        pan = s.base_pan + s.drift_pan + s.ms_pan + jitter_pan
-        tilt = s.base_tilt + s.drift_tilt + s.ms_tilt + jitter_tilt
+        pan = s.drift_pan + s.ms_pan + jitter_pan
+        tilt = s.drift_tilt + s.ms_tilt + jitter_tilt
 
         q_pan = Quaternion((0.0, 1.0, 0.0), pan)
         q_tilt = Quaternion((1.0, 0.0, 0.0), tilt)
 
         self.camera.rotation_mode = "QUATERNION"
-        self.camera.rotation_quaternion = q_pan @ q_tilt
+        self.camera.rotation_quaternion = self.base_rotation @ q_pan @ q_tilt
 
         return {
             "pan_rad": pan,
