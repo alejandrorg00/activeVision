@@ -4,50 +4,62 @@ from pathlib import Path
 
 import cv2
 import numpy as np
+import torch
 
-try:
-    from .foveation import foveate_black_gray
-except ImportError:
-    from attention.foveation import foveate_black_gray
-
+from attention.foveation import foveate_black_gray
 
 DEFAULT_ATTENTION_PARAMS = {
-    # Multiscale center-surround saliency.
+    # Giulia / NeuromorphicAttentionSim-style parameters
+    "size_krn": 16,
+    "r0": 14,
+    "rho": 0.05,
+    "theta": np.pi * 3 / 2,
+    "thetas": np.arange(0, 2 * np.pi, np.pi / 4),
+    "thick": 3,
+    "fltr_resize_perc": [2, 2],
+    "offsetpxs": 0,
+    "offset": (0, 0),
     "num_pyr": 6,
-    "center_sigma": 2.0,
-    "surround_sigma": 8.0,
+    "tau_mem": 0.3,
+    "stride": 1,
+    "out_ch": 1,
 
-    # Softmax beta.
-    # Larger beta means sharper fixation.
-    # Smaller beta means more diffuse fixation.
+    # Softmax beta added on top of Giulia attention.
+    # Larger beta gives sharper sampling.
+    # Smaller beta gives more diffuse sampling.
     "beta": 10.0,
 
-    # RNG seed for sampling from the softmax map.
+    # RNG seed.
     "seed": 0,
 }
 
 
-def _build_event_windows(
-    events: np.ndarray,
-    resolution: tuple[int, int] | None = None,
-    window_period_ms: float = 10.0,
-    max_windows: int | None = None,
-    use_polarity: bool = False,
-) -> tuple[list[np.ndarray], list[float], tuple[int, int]]:
+def _get_device(device: str | torch.device | None = None) -> torch.device:
     """
-    Convert event array to offline temporal event frames.
+    Resolve torch device.
+    """
+    if device is not None:
+        return torch.device(device)
 
-    Expected event format:
-        events[:, 0] = x
-        events[:, 1] = y
-        events[:, 2] = polarity
-        events[:, 3] = timestamp_seconds
+    if torch.cuda.is_available():
+        return torch.device("cuda")
+
+    if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+        return torch.device("mps")
+
+    return torch.device("cpu")
+
+
+def _load_events_npy(events_npy: str | Path) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """
+    Load events.npy with expected columns:
+        x, y, polarity, timestamp_seconds
 
     Returns:
-        windows: list of accumulated event windows, each (H, W) uint8
-        window_times_s: end time of each window, in seconds
-        resolution: (H, W)
+        x, y, p, t_ms
     """
+    events = np.load(events_npy)
+
     if events.ndim != 2 or events.shape[1] < 4:
         raise ValueError(f"Expected events with shape (N, 4). Got {events.shape}.")
 
@@ -58,6 +70,40 @@ def _build_event_windows(
     y = events[:, 1].astype(np.int64)
     p = events[:, 2].astype(np.int64)
     t_ms = events[:, 3].astype(np.float64) * 1e3
+
+    order = np.argsort(t_ms)
+    return x[order], y[order], p[order], t_ms[order]
+
+
+def build_binary_event_windows(
+    events_npy: str | Path,
+    resolution: tuple[int, int] | None = None,
+    window_period_ms: float = 100.0,
+    max_windows: int | None = None,
+    use_polarity: bool = False,
+) -> tuple[list[np.ndarray], list[float], tuple[int, int]]:
+    """
+    Build Giulia-style fixed temporal windows from events.npy.
+
+    This is offline binning over saved events.
+
+    It follows the logic:
+
+        if ti <= time:
+            window[0][yi][xi] = 255
+        else:
+            process window
+            time += window_period
+            reset window
+
+    Important:
+        This is binary accumulation.
+        If a pixel spikes at least once within the temporal window, it becomes 255.
+        It does not normalize by event count.
+        It does not fade.
+        It does not render online.
+    """
+    x, y, p, t_ms = _load_events_npy(events_npy)
 
     if resolution is None:
         height = int(y.max()) + 1
@@ -79,126 +125,117 @@ def _build_event_windows(
     if window_period_ms <= 0:
         raise ValueError("window_period_ms must be > 0.")
 
-    t_start = float(t_ms.min())
-    t_stop = float(t_ms.max())
+    t0 = float(t_ms.min())
+    t1 = float(t_ms.max())
+
+    # Start exactly like Giulia, but shifted to the first event time.
+    # First window is [t0, t0 + window_period_ms].
+    time_boundary = t0 + window_period_ms
+
+    if use_polarity:
+        current = np.zeros((height, width, 3), dtype=np.uint8)
+    else:
+        current = np.zeros((height, width), dtype=np.uint8)
 
     windows: list[np.ndarray] = []
     window_times_s: list[float] = []
 
-    left = t_start
-    right = left + window_period_ms
     n_windows = 0
 
-    while left < t_stop:
-        ind = (t_ms >= left) & (t_ms < right)
+    for xi, yi, pi, ti in zip(x, y, p, t_ms):
+        # Process all elapsed empty windows if needed.
+        while ti > time_boundary:
+            if use_polarity:
+                gray = cv2.cvtColor(current, cv2.COLOR_BGR2GRAY)
+                windows.append(gray.copy())
+            else:
+                windows.append(current.copy())
 
-        frame = np.zeros((height, width), dtype=np.uint8)
+            window_times_s.append(time_boundary * 1e-3)
 
-        if ind.any():
-            xi = x[ind]
-            yi = y[ind]
-            pi = p[ind]
+            n_windows += 1
+            if max_windows is not None and n_windows >= int(max_windows):
+                return windows, window_times_s, (height, width)
 
             if use_polarity:
-                on = pi > 0
-                off = ~on
-
-                if on.any():
-                    frame[yi[on], xi[on]] = 255
-
-                if off.any():
-                    frame[yi[off], xi[off]] = 120
+                current.fill(0)
             else:
-                frame[yi, xi] = 255
+                current.fill(0)
 
-        windows.append(frame)
-        window_times_s.append(right * 1e-3)
+            time_boundary += window_period_ms
 
-        n_windows += 1
-        if max_windows is not None and n_windows >= int(max_windows):
-            break
+        # Giulia-style binary accumulation.
+        if use_polarity:
+            # BGR display convention:
+            # ON events white, OFF events gray.
+            if pi > 0:
+                current[int(yi), int(xi)] = (255, 255, 255)
+            else:
+                current[int(yi), int(xi)] = (120, 120, 120)
+        else:
+            current[int(yi), int(xi)] = 255
 
-        left = right
-        right += window_period_ms
+    # Flush final partial window.
+    if max_windows is None or n_windows < int(max_windows):
+        if use_polarity:
+            gray = cv2.cvtColor(current, cv2.COLOR_BGR2GRAY)
+            windows.append(gray.copy())
+        else:
+            windows.append(current.copy())
+
+        window_times_s.append(time_boundary * 1e-3)
 
     return windows, window_times_s, (height, width)
 
 
-def compute_saliency_map(
-    event_frame: np.ndarray,
-    center_sigma: float = 2.0,
-    surround_sigma: float = 8.0,
-    num_pyr: int = 6,
-    beta: float = 10.0,
-    rng: np.random.Generator | None = None,
-) -> tuple[np.ndarray, tuple[int, int], np.ndarray]:
+def compute_giulia_attention_softmax(
+    window_frame: np.ndarray,
+    net_attention,
+    device: torch.device,
+    resolution: tuple[int, int],
+    attention_params: dict,
+) -> tuple[np.ndarray, tuple[int, int], np.ndarray, np.ndarray, np.ndarray]:
     """
-    Compute saliency map and sample fixation from softmax.
+    Run Giulia/att_module attention on one accumulated event window.
 
-    The selected fixation is always sampled from:
+    Returns:
+        sal_vis:
+            uint8 saliency visualization map.
 
-        prob_map = softmax(beta * saliency_norm)
+        peak_xy:
+            sampled fixation as (x, y).
 
-    There is no selection argument.
+        probs_vis:
+            full probability map.
 
-    Larger beta gives sharper fixation.
-    Smaller beta gives more diffuse fixation.
+        sal_raw:
+            raw saliency map.
+
+        probs_raw:
+            raw probability map.
     """
-    frame = np.asarray(event_frame, dtype=np.float32)
+    height, width = int(resolution[0]), int(resolution[1])
 
-    if frame.ndim != 2:
-        raise ValueError(f"Expected HxW event frame. Got {frame.shape}.")
+    window_u8 = np.asarray(window_frame, dtype=np.uint8)
 
-    height, width = frame.shape
-    saliency = np.zeros((height, width), dtype=np.float32)
+    # att_module.run_attention expects [1, H, W] or compatible.
+    window_torch = torch.from_numpy(window_u8).unsqueeze(0).to(device=device, dtype=torch.float32)
 
-    for scale_idx in range(int(num_pyr)):
-        scale = 1.0 + float(scale_idx)
+    sal_vis, salmax_coords, probs_vis, sal_raw, probs_raw = run_attention(
+        window_torch,
+        net_attention,
+        device,
+        (height, width),
+        int(attention_params["num_pyr"]),
+        beta=float(attention_params.get("beta", 10.0)),
+        object_mask=None,
+    )
 
-        center_sigma_s = max(float(center_sigma) * scale, 0.5)
-        surround_sigma_s = max(
-            float(surround_sigma) * scale,
-            center_sigma_s + 0.5,
-        )
+    # salmax_coords from Giulia code is row, col = y, x
+    peak_y = int(salmax_coords[0])
+    peak_x = int(salmax_coords[1])
 
-        center = cv2.GaussianBlur(frame, (0, 0), center_sigma_s)
-        surround = cv2.GaussianBlur(frame, (0, 0), surround_sigma_s)
-
-        diff = center - surround
-        diff[diff < 0] = 0.0
-
-        saliency += diff
-
-    if rng is None:
-        rng = np.random.default_rng()
-
-    smax = float(saliency.max())
-
-    if smax <= 0:
-        saliency_norm = np.zeros_like(saliency, dtype=np.float32)
-        prob_map = np.full(
-            (height, width),
-            1.0 / float(height * width),
-            dtype=np.float32,
-        )
-
-        flat_idx = int(rng.choice(prob_map.size, p=prob_map.reshape(-1)))
-        peak_y, peak_x = np.unravel_index(flat_idx, prob_map.shape)
-
-        return saliency_norm, (int(peak_x), int(peak_y)), prob_map
-
-    saliency_norm = saliency / (smax + 1e-12)
-
-    logits = float(beta) * saliency_norm
-    logits = logits - float(logits.max())
-
-    exp_logits = np.exp(logits).astype(np.float32)
-    prob_map = exp_logits / (float(exp_logits.sum()) + 1e-12)
-
-    flat_idx = int(rng.choice(prob_map.size, p=prob_map.reshape(-1)))
-    peak_y, peak_x = np.unravel_index(flat_idx, prob_map.shape)
-
-    return saliency_norm.astype(np.float32), (int(peak_x), int(peak_y)), prob_map
+    return sal_vis, (peak_x, peak_y), probs_vis, sal_raw, probs_raw
 
 
 def run_attention_black_gaussian_dataset(
@@ -206,25 +243,27 @@ def run_attention_black_gaussian_dataset(
     output_dir: str | Path,
     resolution: tuple[int, int] | None = None,
     attention_params: dict | None = None,
-    window_period_ms: float = 10.0,
+    window_period_ms: float = 100.0,
     sigma: float | None = None,
     max_windows: int | None = None,
     use_polarity: bool = False,
     clear_existing: bool = True,
     image_prefix: str = "roi",
+    device: str | torch.device | None = None,
+    verbose: bool = False,
 ) -> dict:
     """
-    Fully offline attention + black Gaussian foveation dataset generation.
+    Offline attention dataset generation.
 
     Pipeline:
         events.npy
-            -> temporal event windows
-            -> accumulated event window
-            -> multiscale center-surround saliency
+            -> Giulia-style fixed temporal windows
+            -> binary accumulated event window
+            -> Giulia/att_module attention
             -> softmax(beta * saliency)
-            -> sample saliency/fixation point
-            -> black Gaussian foveation centered on sampled saliency point
-            -> save fov/roi_00000.png, fov/roi_00001.png, ...
+            -> sampled fixation
+            -> black Gaussian foveation over the accumulated event window
+            -> save fov/roi_00000.png, ...
             -> save saccades.dat
 
     Output layout:
@@ -234,9 +273,6 @@ def run_attention_black_gaussian_dataset(
                 roi_00001.png
                 ...
             saccades.dat
-
-    saccades.dat columns:
-        idx time_s pre_x pre_y post_x post_y dx dy
     """
     events_npy = Path(events_npy)
     output_dir = Path(output_dir)
@@ -258,17 +294,22 @@ def run_attention_black_gaussian_dataset(
     if attention_params is not None:
         merged_params.update(attention_params)
 
-    rng = np.random.default_rng(int(merged_params.get("seed", 0)))
+    torch.manual_seed(int(merged_params.get("seed", 0)))
+    np.random.seed(int(merged_params.get("seed", 0)))
 
-    events = np.load(events_npy)
+    device_torch = _get_device(device)
 
-    windows, window_times_s, (height, width) = _build_event_windows(
-        events=events,
+    windows, window_times_s, (height, width) = build_binary_event_windows(
+        events_npy=events_npy,
         resolution=resolution,
         window_period_ms=window_period_ms,
         max_windows=max_windows,
         use_polarity=use_polarity,
     )
+
+    net_attention = initialise_attention(device_torch, merged_params)
+    net_attention = net_attention.to(device_torch)
+    net_attention.eval()
 
     if sigma is None:
         sigma = max(1.0, 0.10 * float(min(height, width)))
@@ -278,53 +319,62 @@ def run_attention_black_gaussian_dataset(
 
     previous_peak: tuple[int, int] | None = None
 
-    for idx, (window_frame, time_s) in enumerate(zip(windows, window_times_s)):
-        _, (peak_x, peak_y), _ = compute_saliency_map(
-            window_frame,
-            center_sigma=merged_params.get("center_sigma", 2.0),
-            surround_sigma=merged_params.get("surround_sigma", 8.0),
-            num_pyr=merged_params.get("num_pyr", 6),
-            beta=merged_params.get("beta", 10.0),
-            rng=rng,
-        )
+    with torch.no_grad():
+        for idx, (window_frame, time_s) in enumerate(zip(windows, window_times_s)):
+            if verbose:
+                print(
+                    idx,
+                    "time_s=", float(time_s),
+                    "nonzero=", int(np.count_nonzero(window_frame)),
+                    "max=", int(window_frame.max()),
+                    "sum=", int(window_frame.sum()),
+                )
 
-        fov_black = foveate_black_gray(
-            window_frame,
-            center_x=peak_x,
-            center_y=peak_y,
-            sigma=float(sigma),
-        )
+            _, (peak_x, peak_y), _, _, _ = compute_giulia_attention_softmax(
+                window_frame=window_frame,
+                net_attention=net_attention,
+                device=device_torch,
+                resolution=(height, width),
+                attention_params=merged_params,
+            )
 
-        fov_path = fov_dir / f"{image_prefix}_{idx:05d}.png"
-        ok = cv2.imwrite(str(fov_path), fov_black)
+            fov_black = foveate_black_gray(
+                window_frame,
+                center_x=peak_x,
+                center_y=peak_y,
+                sigma=float(sigma),
+            )
 
-        if not ok:
-            raise RuntimeError(f"Could not write foveation image: {fov_path}")
+            fov_path = fov_dir / f"{image_prefix}_{idx:05d}.png"
+            ok = cv2.imwrite(str(fov_path), fov_black)
 
-        fov_paths.append(str(fov_path))
+            if not ok:
+                raise RuntimeError(f"Could not write foveation image: {fov_path}")
 
-        if previous_peak is None:
-            pre_x, pre_y = peak_x, peak_y
-            dx, dy = 0.0, 0.0
-        else:
-            pre_x, pre_y = previous_peak
-            dx = float(peak_x - pre_x)
-            dy = float(peak_y - pre_y)
+            fov_paths.append(str(fov_path))
 
-        saccades.append(
-            [
-                int(idx),
-                float(time_s),
-                int(pre_x),
-                int(pre_y),
-                int(peak_x),
-                int(peak_y),
-                float(dx),
-                float(dy),
-            ]
-        )
+            if previous_peak is None:
+                pre_x, pre_y = peak_x, peak_y
+                dx, dy = 0.0, 0.0
+            else:
+                pre_x, pre_y = previous_peak
+                dx = float(peak_x - pre_x)
+                dy = float(peak_y - pre_y)
 
-        previous_peak = (peak_x, peak_y)
+            saccades.append(
+                [
+                    int(idx),
+                    float(time_s),
+                    int(pre_x),
+                    int(pre_y),
+                    int(peak_x),
+                    int(peak_y),
+                    float(dx),
+                    float(dy),
+                ]
+            )
+
+            previous_peak = (peak_x, peak_y)
 
     saccades_arr = np.asarray(saccades, dtype=np.float64)
 
@@ -355,6 +405,7 @@ def run_attention_black_gaussian_dataset(
         "sigma": float(sigma),
         "beta": float(merged_params.get("beta", 10.0)),
         "window_period_ms": float(window_period_ms),
+        "device": str(device_torch),
         "fov_paths": fov_paths,
     }
 
@@ -368,11 +419,6 @@ def foveations_to_gif(
 ) -> str:
     """
     Create a GIF from saved foveation images.
-
-    This is only for display or inspection.
-    It is not part of the dataset output.
-
-    loop=0 means loop indefinitely.
     """
     from PIL import Image
 
@@ -431,7 +477,7 @@ def _make_saliency_display_panel(
     peak_y: int,
 ) -> np.ndarray:
     """
-    Saliency map panel for display only.
+    Saliency map panel.
     """
     sal_u8 = _normalise_to_uint8(saliency_map)
 
@@ -468,15 +514,16 @@ def _make_window_action_display_panel(
     post_y: int,
 ) -> np.ndarray:
     """
-    Accumulated event-window panel with green action vector.
-
-    The vector goes from previous saliency point to current saliency point:
-        (pre_x, pre_y) -> (post_x, post_y)
+    Accumulated binary event-window panel with green action vector.
     """
     window_u8 = np.asarray(window_frame, dtype=np.uint8)
+
+    # Important:
+    # keep Giulia-style binary accumulated event map.
+    # Do not normalize by event counts.
     panel = cv2.cvtColor(window_u8, cv2.COLOR_GRAY2BGR)
 
-    green = (20, 255, 57)  # BGR phosphor green
+    green = (20, 255, 57)
 
     cv2.arrowedLine(
         panel,
@@ -524,23 +571,21 @@ def make_saliency_window_action_gif(
     output_gif: str | Path,
     resolution: tuple[int, int] | None = None,
     attention_params: dict | None = None,
-    window_period_ms: float = 10.0,
+    window_period_ms: float = 100.0,
     max_windows: int | None = None,
     use_polarity: bool = False,
     fps: int = 20,
     loop: int = 0,
+    device: str | torch.device | None = None,
 ) -> str:
     """
-    Display-only GIF.
+    Display GIF.
 
     Creates:
-        saliency map | accumulated event window + action vector
+        saliency map | accumulated binary event window + action vector
 
-    This does not write dataset outputs.
-    It only creates a GIF for notebook inspection.
-
-    The action vector is read from saccades.dat:
-        pre_x, pre_y -> post_x, post_y
+    This reads events.npy and saccades.dat.
+    It does not use foveation images.
     """
     from PIL import Image
 
@@ -554,17 +599,22 @@ def make_saliency_window_action_gif(
     if attention_params is not None:
         merged_params.update(attention_params)
 
-    rng = np.random.default_rng(int(merged_params.get("seed", 0)))
+    torch.manual_seed(int(merged_params.get("seed", 0)))
+    np.random.seed(int(merged_params.get("seed", 0)))
 
-    events = np.load(events_npy)
+    device_torch = _get_device(device)
 
-    windows, _, (height, width) = _build_event_windows(
-        events=events,
+    windows, _, (height, width) = build_binary_event_windows(
+        events_npy=events_npy,
         resolution=resolution,
         window_period_ms=window_period_ms,
         max_windows=max_windows,
         use_polarity=use_polarity,
     )
+
+    net_attention = initialise_attention(device_torch, merged_params)
+    net_attention = net_attention.to(device_torch)
+    net_attention.eval()
 
     if not saccades_path.exists():
         raise FileNotFoundError(f"saccades.dat not found: {saccades_path}")
@@ -582,49 +632,49 @@ def make_saliency_window_action_gif(
 
     frames = []
 
-    for idx in range(n):
-        window_frame = windows[idx]
+    with torch.no_grad():
+        for idx in range(n):
+            window_frame = windows[idx]
 
-        saliency_map, (peak_x, peak_y), _ = compute_saliency_map(
-            window_frame,
-            center_sigma=merged_params.get("center_sigma", 2.0),
-            surround_sigma=merged_params.get("surround_sigma", 8.0),
-            num_pyr=merged_params.get("num_pyr", 6),
-            beta=merged_params.get("beta", 10.0),
-            rng=rng,
-        )
+            sal_vis, (peak_x, peak_y), _, sal_raw, _ = compute_giulia_attention_softmax(
+                window_frame=window_frame,
+                net_attention=net_attention,
+                device=device_torch,
+                resolution=(height, width),
+                attention_params=merged_params,
+            )
 
-        # saccades.dat columns:
-        # idx time_s pre_x pre_y post_x post_y dx dy
-        pre_x = int(round(saccades[idx, 2]))
-        pre_y = int(round(saccades[idx, 3]))
-        post_x = int(round(saccades[idx, 4]))
-        post_y = int(round(saccades[idx, 5]))
+            # saccades.dat columns:
+            # idx time_s pre_x pre_y post_x post_y dx dy
+            pre_x = int(round(saccades[idx, 2]))
+            pre_y = int(round(saccades[idx, 3]))
+            post_x = int(round(saccades[idx, 4]))
+            post_y = int(round(saccades[idx, 5]))
 
-        saliency_panel = _make_saliency_display_panel(
-            saliency_map=saliency_map,
-            peak_x=peak_x,
-            peak_y=peak_y,
-        )
+            saliency_panel = _make_saliency_display_panel(
+                saliency_map=sal_raw,
+                peak_x=peak_x,
+                peak_y=peak_y,
+            )
 
-        window_action_panel = _make_window_action_display_panel(
-            window_frame=window_frame,
-            pre_x=pre_x,
-            pre_y=pre_y,
-            post_x=post_x,
-            post_y=post_y,
-        )
+            window_action_panel = _make_window_action_display_panel(
+                window_frame=window_frame,
+                pre_x=pre_x,
+                pre_y=pre_y,
+                post_x=post_x,
+                post_y=post_y,
+            )
 
-        composite_bgr = np.concatenate(
-            [
-                saliency_panel,
-                window_action_panel,
-            ],
-            axis=1,
-        )
+            composite_bgr = np.concatenate(
+                [
+                    saliency_panel,
+                    window_action_panel,
+                ],
+                axis=1,
+            )
 
-        composite_rgb = cv2.cvtColor(composite_bgr, cv2.COLOR_BGR2RGB)
-        frames.append(Image.fromarray(composite_rgb))
+            composite_rgb = cv2.cvtColor(composite_bgr, cv2.COLOR_BGR2RGB)
+            frames.append(Image.fromarray(composite_rgb))
 
     if len(frames) == 0:
         blank = np.zeros((height, width * 2, 3), dtype=np.uint8)

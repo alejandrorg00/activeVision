@@ -58,3 +58,46 @@ def foveate_black_gray(
 
     out = frame_gray.astype(np.float32) * gaussian
     return np.clip(out, 0, 255).astype(np.uint8)
+
+def foveations_to_gif(
+    fov_dir: str | Path,
+    output_gif: str | Path,
+    fps: int = 20,
+    loop: int = 0,
+    image_prefix: str = "roi",
+) -> str:
+    """
+    Create a GIF from saved foveation images.
+    """
+    from PIL import Image
+
+    fov_dir = Path(fov_dir)
+    output_gif = Path(output_gif)
+
+    output_gif.parent.mkdir(parents=True, exist_ok=True)
+
+    frame_paths = sorted(fov_dir.glob(f"{image_prefix}_*.png"))
+
+    if len(frame_paths) == 0:
+        raise RuntimeError(f"No foveation images found in {fov_dir}")
+
+    frames = [
+        Image.open(frame_path).convert("P", palette=Image.Palette.ADAPTIVE)
+        for frame_path in frame_paths
+    ]
+
+    duration_ms = int(round(1000.0 / float(fps)))
+
+    frames[0].save(
+        output_gif,
+        save_all=True,
+        append_images=frames[1:],
+        duration=duration_ms,
+        loop=int(loop),
+        optimize=True,
+    )
+
+    for frame in frames:
+        frame.close()
+
+    return str(output_gif)
