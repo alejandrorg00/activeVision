@@ -1,10 +1,10 @@
 {
   "object_path": "c:\\Users\\User\\Desktop\\Github\\activeVision\\data\\airplane_010.blend",
   "output_dir": "c:\\Users\\User\\Desktop\\Github\\activeVision\\data\\renders\\airplane_demo\\motion_sequence",
-  "num_frames": 1000,
+  "num_frames": 100,
   "fps": 1000,
   "resolution": 256,
-  "samples": 8,
+  "samples": 1,
   "object_target_size": 0.45,
   "object_azimuth_deg": 315.0,
   "object_elevation_deg": 30.0,
@@ -28,21 +28,17 @@
   "light_size": 10.0,
   "light_strength": 50.0,
   "drift_sigma_deg": [
-    0.003,
-    0.003
+    0.01,
+    0.009
   ],
-  "microsaccade_rate_hz": 5.0,
+  "microsaccade_rate_hz": 10.0,
   "microsaccade_amp_deg": [
-    0.05,
-    0.25
+    0.2,
+    1.0
   ],
   "microsaccade_dur_ms": [
     10,
-    25
-  ],
-  "jitter_sigma_deg": [
-    0.005,
-    0.005
+    30
   ],
   "seed": 0
 }

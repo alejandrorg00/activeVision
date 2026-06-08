@@ -151,7 +151,6 @@ def render_camera_motion_sequence(
     microsaccade_rate_hz: float = 5.0,
     microsaccade_amp_deg=(0.05, 0.30),
     microsaccade_dur_ms=(10, 30),
-    jitter_sigma_deg=(0.005, 0.005),
     seed: int = 0,
     save_metadata: bool = True,
 ) -> dict:
@@ -196,7 +195,6 @@ def render_camera_motion_sequence(
         microsaccade_rate_hz=microsaccade_rate_hz,
         microsaccade_amp_deg=microsaccade_amp_deg,
         microsaccade_dur_ms=microsaccade_dur_ms,
-        jitter_sigma_deg=jitter_sigma_deg,
         seed=seed,
     )
 
@@ -228,7 +226,6 @@ def render_camera_motion_sequence(
         "microsaccade_rate_hz": float(microsaccade_rate_hz),
         "microsaccade_amp_deg": list(microsaccade_amp_deg),
         "microsaccade_dur_ms": list(microsaccade_dur_ms),
-        "jitter_sigma_deg": list(jitter_sigma_deg),
         "seed": int(seed),
     }
 

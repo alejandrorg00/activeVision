@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from pathlib import Path
+
 import numpy as np
 
 
@@ -14,22 +16,6 @@ def foveate_black_gray(
     Black Gaussian foveation.
 
     Keeps the image around the Gaussian center and suppresses the periphery.
-
-    Parameters
-    ----------
-    frame_gray:
-        Grayscale frame, shape (H, W).
-
-    center_x, center_y:
-        Gaussian center in pixel coordinates.
-
-    sigma:
-        Gaussian standard deviation in pixels.
-
-    Returns
-    -------
-    out:
-        Foveated grayscale frame, shape (H, W), uint8.
     """
     frame_gray = np.asarray(frame_gray)
 
@@ -59,6 +45,7 @@ def foveate_black_gray(
     out = frame_gray.astype(np.float32) * gaussian
     return np.clip(out, 0, 255).astype(np.uint8)
 
+
 def foveations_to_gif(
     fov_dir: str | Path,
     output_gif: str | Path,
@@ -68,6 +55,10 @@ def foveations_to_gif(
 ) -> str:
     """
     Create a GIF from saved foveation images.
+
+    This is only for notebook display or inspection.
+
+    loop=0 means loop indefinitely.
     """
     from PIL import Image
 
