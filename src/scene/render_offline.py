@@ -316,20 +316,41 @@ def frames_to_gif(
     return str(output_gif)
 
 
-def _add_iebcs_lux_to_path() -> Path:
+def _add_iebcs_lux_to_path() -> tuple[Path, Path]:
     """
-    Add ./src/IEBCS/lux to sys.path.
+    Add IEBCS module and lux-noise directories to sys.path.
 
-    This assumes this file is:
+    Expected repo layout:
+
         ./src/scene/render_offline.py
+        ./src/IEBCS/event_buffer.py
+        ./src/IEBCS/dvs_sensor.py
+        ./src/IEBCS/dat_files.py
+        ./src/IEBCS/lux/noise_pos_*.npy
+        ./src/IEBCS/lux/noise_neg_*.npy
 
-    Therefore:
-        src_dir = ./src
-        lux_dir = ./src/IEBCS/lux
+    Returns
+    -------
+    iebcs_dir:
+        Directory containing event_buffer.py, dvs_sensor.py, dat_files.py.
+
+    lux_dir:
+        Directory containing lux noise files.
     """
     this_file = Path(__file__).resolve()
+
+    # this_file = .../src/scene/render_offline.py
+    # src_dir   = .../src
     src_dir = this_file.parents[1]
-    lux_dir = src_dir / "IEBCS" / "lux"
+
+    iebcs_dir = src_dir / "IEBCS"
+    lux_dir = iebcs_dir / "lux"
+
+    if not iebcs_dir.exists():
+        raise FileNotFoundError(
+            f"Could not find IEBCS module directory at: {iebcs_dir}\n"
+            "Expected path: ./src/IEBCS"
+        )
 
     if not lux_dir.exists():
         raise FileNotFoundError(
@@ -337,11 +358,12 @@ def _add_iebcs_lux_to_path() -> Path:
             "Expected path: ./src/IEBCS/lux"
         )
 
-    lux_dir_str = str(lux_dir)
-    if lux_dir_str not in sys.path:
-        sys.path.insert(0, lux_dir_str)
+    for path in (iebcs_dir, lux_dir):
+        path_str = str(path)
+        if path_str not in sys.path:
+            sys.path.insert(0, path_str)
 
-    return lux_dir
+    return iebcs_dir, lux_dir
 
 
 def _read_frame_luminance_klux(frame_path: str | Path):

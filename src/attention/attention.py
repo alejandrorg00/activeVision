@@ -1,479 +1,647 @@
-# -*- coding: utf-8 -*-
-"""
-Alejandro Rodriguez-Garcia 01/02/2026
+from __future__ import annotations
 
-    Adapted from CTU-EDNeuromorphic (Giulia D'Angelo). 
+from pathlib import Path
 
-    It implements an event-driven attention mechanism that transforms
-    DVS event windows into a multi-scale pyramid and processes them through a 
-    Conv2D + LIF (spiking) network with Von Mises kernels to generate a saliency
-    map.
-
-"""
-
-import numpy as np
 import cv2
-from collections import deque
-from scipy.special import iv
+import numpy as np
 
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
-import torchvision
-import sinabs.layers as sl
-from skimage.transform import rescale
+try:
+    from .foveation import foveate_black_gray
+except ImportError:
+    from attention.foveation import foveate_black_gray
 
 
-# -----------------------------
-# Event-window visual utilities
-# -----------------------------
-def time_window(events, camera_events, height, width, window_period):
-    e_x = events["data"][camera_events]["dvs"]["x"]
-    e_y = events["data"][camera_events]["dvs"]["y"]
-    e_ts = np.multiply(events["data"][camera_events]["dvs"]["ts"], 1e3)
-    e_pol = events["data"][camera_events]["dvs"]["pol"]
+DEFAULT_ATTENTION_PARAMS = {
+    # Multiscale center-surround saliency.
+    "num_pyr": 6,
+    "center_sigma": 2.0,
+    "surround_sigma": 8.0,
 
-    time = window_period
-    window_pos = np.zeros((height, width), dtype=np.uint8)
-    window_neg = np.zeros((height, width), dtype=np.uint8)
+    # Softmax beta.
+    # Larger beta means sharper fixation.
+    # Smaller beta means more diffuse fixation.
+    "beta": 10.0,
 
-    for x, y, ts, pol in zip(e_x, e_y, e_ts, e_pol):
-        if ts <= time:
-            if pol == 1:
-                window_pos[y, x] = 255
-            else:
-                window_neg[y, x] = 255
-        else:
-            cv2.imshow("Event Pos and Neg", np.hstack((window_pos, window_neg)))
-            cv2.waitKey(1)
-            time += window_period
-            window_pos.fill(0)
-            window_neg.fill(0)
+    # RNG seed for sampling from the softmax map.
+    "seed": 0,
+}
 
 
-def sliding_window(events, camera_events, height, width, initial_window_period, sliding_wdw, time_buff):
-    e_x = events["data"][camera_events]["dvs"]["x"]
-    e_y = events["data"][camera_events]["dvs"]["y"]
-    e_ts = np.multiply(events["data"][camera_events]["dvs"]["ts"], 1e3)
-    e_pol = events["data"][camera_events]["dvs"]["pol"]
-
-    sliding_window_pos = np.zeros((height, width), dtype=np.uint8)
-    sliding_window_neg = np.zeros((height, width), dtype=np.uint8)
-    event_queue = deque()
-
-    for x, y, ts, pol in zip(e_x, e_y, e_ts, e_pol):
-        if ts <= initial_window_period:
-            if pol == 1:
-                sliding_window_pos[y, x] = 255
-            else:
-                sliding_window_neg[y, x] = 255
-            event_queue.append((x, y, ts, pol))
-        else:
-            if ts <= initial_window_period + time_buff:
-                while event_queue and event_queue[0][2] < ts - initial_window_period:
-                    x_old, y_old, _, pol_old = event_queue.popleft()
-                    if pol_old == 1:
-                        sliding_window_pos[y_old, x_old] = 0
-                    else:
-                        sliding_window_neg[y_old, x_old] = 0
-
-                if pol == 1:
-                    sliding_window_pos[y, x] = 255
-                else:
-                    sliding_window_neg[y, x] = 255
-                event_queue.append((x, y, ts, pol))
-            else:
-                cv2.imshow("Event Pos and Neg", np.hstack((sliding_window_pos, sliding_window_neg)))
-                cv2.waitKey(1)
-                time_buff += sliding_wdw
-
-
-def number_events(events, camera_events, height, width, num_events):
-    e_x = events["data"][camera_events]["dvs"]["x"]
-    e_y = events["data"][camera_events]["dvs"]["y"]
-    e_pol = events["data"][camera_events]["dvs"]["pol"]
-
-    window_pos = np.zeros((height, width), dtype=np.uint8)
-    window_neg = np.zeros((height, width), dtype=np.uint8)
-
-    for i in range(0, len(e_x), num_events):
-        window_pos.fill(0)
-        window_neg.fill(0)
-
-        for j in range(i, min(i + num_events, len(e_x))):
-            x, y, pol = int(e_x[j]), int(e_y[j]), int(e_pol[j])
-            if pol == 1:
-                window_pos[y, x] = 255
-            else:
-                window_neg[y, x] = 255
-
-        cv2.imshow("Event Pos and Neg", np.hstack((window_pos, window_neg)))
-        cv2.waitKey(1)
-
-
-# -----------------------------
-# Von Mises filter bank
-# -----------------------------
-def zero_2pi_tan(x, y):
-    return np.arctan2(y, x) % (2 * np.pi)
-
-
-def vm_filter(theta, scale, rho=0.1, r0=0, thick=0.5, offset=(0, 0)):
-    height, width = scale, scale
-    vm = np.empty((height, width), dtype=np.float32)
-    offset_x, offset_y = offset
-
-    for x in range(width):
-        for y in range(height):
-            X = (x - width / 2) + r0 * np.cos(theta) - offset_x * np.cos(theta)
-            Y = (height / 2 - y) + r0 * np.sin(theta) - offset_y * np.sin(theta)
-            r = np.sqrt(X ** 2 + Y ** 2)
-            angle = zero_2pi_tan(X, Y)
-            vm[y, x] = np.exp(thick * rho * r0 * np.cos(angle - theta)) / iv(0, r - r0)
-
-    return vm
-
-
-def VMkernels(thetas, size, rho, r0, thick, offset, fltr_resize_perc):
-    filters = []
-    for theta in thetas:
-        f = vm_filter(theta, size, rho=rho, r0=r0, thick=thick, offset=offset)
-        f = rescale(f, fltr_resize_perc, anti_aliasing=False)
-        filters.append(f)
-    filters = torch.tensor(np.stack(filters).astype(np.float32))  # [n_filters, Kh, Kw]
-    return filters
-
-
-# -----------------------------
-# Attention network definition
-# -----------------------------
-def net_def(filters, tau_mem, in_ch, out_ch, size_krn, device, stride):
+def _build_event_windows(
+    events: np.ndarray,
+    resolution: tuple[int, int] | None = None,
+    window_period_ms: float = 10.0,
+    max_windows: int | None = None,
+    use_polarity: bool = False,
+) -> tuple[list[np.ndarray], list[float], tuple[int, int]]:
     """
-    Conv(in_ch=num_pyr) + LIF.
-    IMPORTANT: in_ch must match pyramid channels built in run_attention (== num_pyr).
-    """
-    net = nn.Sequential(
-        nn.Conv2d(in_ch, out_ch, (size_krn, size_krn), stride=stride, bias=False),
-        sl.LIF(tau_mem),
-    )
-    # filters expected shape [out_ch, Kh, Kw]; we load into conv as [out_ch, 1, Kh, Kw] only if in_ch==1
-    # Here in_ch == num_pyr, so we replicate the same spatial filter across channels (simple and stable).
-    # Shape needed: [out_ch, in_ch, Kh, Kw]
-    w = filters.unsqueeze(1).repeat(1, in_ch, 1, 1)  # replicate across pyramid channels
-    net[0].weight.data = w.to(device)
+    Convert event array to offline temporal event frames.
 
-    # keep your original state-device handling
-    net[1].v_mem = net[1].tau_mem * net[1].v_mem.to(device)
-    return net
+    Expected event format:
+        events[:, 0] = x
+        events[:, 1] = y
+        events[:, 2] = polarity
+        events[:, 3] = timestamp_seconds
 
-
-def initialise_attention(device, ATTENTION_PARAMS):
-    vm_kernels = VMkernels(
-        ATTENTION_PARAMS["thetas"],
-        ATTENTION_PARAMS["size_krn"],
-        ATTENTION_PARAMS["rho"],
-        ATTENTION_PARAMS["r0"],
-        ATTENTION_PARAMS["thick"],
-        ATTENTION_PARAMS["offset"],
-        ATTENTION_PARAMS["fltr_resize_perc"],
-    )
-
-    net_attention = net_def(
-        vm_kernels,
-        ATTENTION_PARAMS["tau_mem"],
-        in_ch=int(ATTENTION_PARAMS["num_pyr"]),   # <-- MUST match pyramid channels
-        out_ch=int(ATTENTION_PARAMS["out_ch"]),
-        size_krn=int(ATTENTION_PARAMS["size_krn"]),
-        device=device,
-        stride=int(ATTENTION_PARAMS["stride"]),
-    )
-    return net_attention
-
-
-# -----------------------------
-# Attention computation
-# -----------------------------
-def _standardize_window_to_4d(window, device):
-    """
-    Accepts:
-      - [1,H,W]   (your current att_window)
-      - [H,W]
-      - [T,H,W]   (future time bins)
-      - [T,1,H,W]
-      - [B,1,H,W]
     Returns:
-      X: [N,1,H,W] where N is batch-like dimension (time or batch)
-      mode: "single" or "time"
+        windows: list of accumulated event windows, each (H, W) uint8
+        window_times_s: end time of each window, in seconds
+        resolution: (H, W)
     """
-    if isinstance(window, np.ndarray):
-        window = torch.from_numpy(window)
+    if events.ndim != 2 or events.shape[1] < 4:
+        raise ValueError(f"Expected events with shape (N, 4). Got {events.shape}.")
 
-    window = window.to(device=device, dtype=torch.float32)
+    if events.shape[0] == 0:
+        raise ValueError("events array is empty.")
 
-    if window.ndim == 2:
-        # [H,W] -> [1,1,H,W]
-        X = window.unsqueeze(0).unsqueeze(0)
-        return X, "single"
+    x = events[:, 0].astype(np.int64)
+    y = events[:, 1].astype(np.int64)
+    p = events[:, 2].astype(np.int64)
+    t_ms = events[:, 3].astype(np.float64) * 1e3
 
-    if window.ndim == 3:
-        # could be [1,H,W] or [T,H,W]
-        # treat first dim as N
-        X = window.unsqueeze(1)  # [N,1,H,W]
-        mode = "time" if window.shape[0] > 1 else "single"
-        return X, mode
-
-    if window.ndim == 4:
-        # assume already [N,1,H,W] or [B,1,H,W]
-        if window.shape[1] != 1:
-            raise ValueError(f"Expected channel=1 in 4D window, got {tuple(window.shape)}")
-        mode = "time" if window.shape[0] > 1 else "single"
-        return window, mode
-
-    raise ValueError(f"Unexpected window shape: {tuple(window.shape)}")
-
-
-def run_attention(window, net, device, resolution, num_pyr, beta: float = 0.0, object_mask=None):
-    """
-    Builds a pyramid with num_pyr channels:
-      channel k corresponds to downscale by factor (k+1), then upsample back to (H,W).
-    Then runs Conv+LIF on [N, num_pyr, H, W].
-
-    Compatible with the current att_window: [1,H,W] with 0/255 events.
-
-    Behavior
-    --------
-    - Probabilities are computed normally over the full image.
-    - If object_mask is provided, sampling is restricted to pixels inside the mask,
-      but using the original full-image probabilities as weights.
-    - For visualization, probs_vis is always the full-image probability map.
-      The mask is only used later as an overlay contour in the debug panel.
-
-    Returns
-    -------
-    sal_vis : np.ndarray, uint8, shape [H, W]
-        Saliency map normalized for visualization.
-    salmax_coords : tuple
-        (row, col) coordinates of selected peak.
-    probs_vis : np.ndarray, float32, shape [H, W]
-        Full-image probability map for plotting.
-    sal_raw : np.ndarray, float32, shape [H, W]
-        Raw saliency/grouping map before visualization normalization.
-    probs_raw : np.ndarray, float32, shape [H, W]
-        Raw full-image fixation probability map.
-    """
-
-    H, W = int(resolution[0]), int(resolution[1])
-    num_pyr = int(num_pyr)
-
-    # 1) standardize
-    X1, mode = _standardize_window_to_4d(window, device=device)  # [N,1,H,W]
-
-    # normalize if 0..255
-    if X1.max() > 1.5:
-        X1 = X1 / 255.0
-    X1 = X1.clamp(min=0.0)
-
-    # ensure spatial size matches expected resolution
-    if X1.shape[-2:] != (H, W):
-        X1 = F.interpolate(X1, size=(H, W), mode="nearest")
-
-    # 2) build pyramid channels
-    pyr = []
-    for k in range(num_pyr):
-        factor = k + 1
-        h = max(1, H // factor)
-        w = max(1, W // factor)
-
-        small = F.interpolate(X1, size=(h, w), mode="bilinear", align_corners=False)
-        back = F.interpolate(small, size=(H, W), mode="bilinear", align_corners=False)
-        pyr.append(back)
-
-    # [N, num_pyr, H, W]
-    X = torch.cat(pyr, dim=1)
-
-    # 3) forward Conv+LIF
-    out = net(X)
-    out = out.type(torch.float32)
-
-    if out.shape[-2:] != (H, W):
-        out = F.interpolate(out, size=(H, W), mode="bilinear", align_corners=False)
-
-    # 4) aggregate over N and channels
-    out_sum = out.sum(dim=0, keepdim=True)
-    out_sum = out_sum.sum(dim=1, keepdim=True)
-    salmap_torch = out_sum.squeeze(0).squeeze(0)  # [H,W]
-
-    # 5) fixation distribution
-    logits_full = float(beta) * (salmap_torch - salmap_torch.max())
-    logits_full = logits_full.flatten().clone()
-
-    # Full-image probability distribution
-    probs_full = torch.softmax(logits_full, dim=0)
-
-    mask_2d = None
-    mask_flat = None
-
-    if object_mask is not None:
-        mask_2d = torch.as_tensor(object_mask, device=device) > 0
-
-        if mask_2d.ndim != 2:
-            raise ValueError(f"object_mask must have shape [H,W], got {tuple(mask_2d.shape)}")
-
-        if mask_2d.shape != (H, W):
-            mask_2d = mask_2d.float().unsqueeze(0).unsqueeze(0)
-            mask_2d = F.interpolate(mask_2d, size=(H, W), mode="nearest")
-            mask_2d = mask_2d.squeeze(0).squeeze(0) > 0.5
-
-        mask_flat = mask_2d.flatten()
-
-        if mask_flat.sum() == 0:
-            raise ValueError("object_mask contains no valid pixels")
-
-        # Restrict sampling to mask, but keep original full-image probabilities
-        valid_idx = torch.nonzero(mask_flat, as_tuple=False).squeeze(1)
-        valid_weights = probs_full[valid_idx]
-
-        if torch.sum(valid_weights) <= 0:
-            raise ValueError("Masked region has zero probability mass")
-
-        sampled_local = torch.multinomial(valid_weights, 1).item()
-        idx = valid_idx[sampled_local].item()
+    if resolution is None:
+        height = int(y.max()) + 1
+        width = int(x.max()) + 1
     else:
-        idx = torch.multinomial(probs_full, 1).item()
+        height, width = int(resolution[0]), int(resolution[1])
 
-    salmax_coords = np.unravel_index(idx, (H, W))
+    valid = (x >= 0) & (x < width) & (y >= 0) & (y < height)
 
-    # 6) raw maps
-    sal_raw = salmap_torch.detach().cpu().numpy().astype(np.float32)
-    probs_raw = probs_full.view(H, W).detach().cpu().numpy().astype(np.float32)
+    x = x[valid]
+    y = y[valid]
+    p = p[valid]
+    t_ms = t_ms[valid]
 
-    # 7) visualization maps
-    den = sal_raw.max() - sal_raw.min()
-    if den < 1e-8:
-        sal_vis = np.zeros((H, W), dtype=np.uint8)
-    else:
-        sal_vis = ((sal_raw - sal_raw.min()) / (den + 1e-8) * 255.0).astype(np.uint8)
+    if x.size == 0:
+        raise ValueError("No valid events remain after resolution filtering.")
 
-    # Always plot the full probability map
-    probs_vis = probs_raw.copy()
+    window_period_ms = float(window_period_ms)
+    if window_period_ms <= 0:
+        raise ValueError("window_period_ms must be > 0.")
 
-    return sal_vis, salmax_coords, probs_vis, sal_raw, probs_raw
+    t_start = float(t_ms.min())
+    t_stop = float(t_ms.max())
+
+    windows: list[np.ndarray] = []
+    window_times_s: list[float] = []
+
+    left = t_start
+    right = left + window_period_ms
+    n_windows = 0
+
+    while left < t_stop:
+        ind = (t_ms >= left) & (t_ms < right)
+
+        frame = np.zeros((height, width), dtype=np.uint8)
+
+        if ind.any():
+            xi = x[ind]
+            yi = y[ind]
+            pi = p[ind]
+
+            if use_polarity:
+                on = pi > 0
+                off = ~on
+
+                if on.any():
+                    frame[yi[on], xi[on]] = 255
+
+                if off.any():
+                    frame[yi[off], xi[off]] = 120
+            else:
+                frame[yi, xi] = 255
+
+        windows.append(frame)
+        window_times_s.append(right * 1e-3)
+
+        n_windows += 1
+        if max_windows is not None and n_windows >= int(max_windows):
+            break
+
+        left = right
+        right += window_period_ms
+
+    return windows, window_times_s, (height, width)
 
 
-###############################################################################
-###############################################################################
-###############################################################################
-
-# Debug helpers
-def draw_peak_arrow(im_bgr, peak_x, peak_y, color=(255, 255, 255),
-                    circle_r=6, circle_thick=2, arrow_thick=2, tip_length=0.2):
+def compute_saliency_map(
+    event_frame: np.ndarray,
+    center_sigma: float = 2.0,
+    surround_sigma: float = 8.0,
+    num_pyr: int = 6,
+    beta: float = 10.0,
+    rng: np.random.Generator | None = None,
+) -> tuple[np.ndarray, tuple[int, int], np.ndarray]:
     """
-    Dibuja círculo y flecha desde el centro hacia el punto atencional.
+    Compute saliency map and sample fixation from softmax.
+
+    The selected fixation is always sampled from:
+
+        prob_map = softmax(beta * saliency_norm)
+
+    There is no selection argument.
+
+    Larger beta gives sharper fixation.
+    Smaller beta gives more diffuse fixation.
     """
-    H, W = im_bgr.shape[:2]
-    cx, cy = W // 2, H // 2
-    px, py = int(peak_x), int(peak_y)
+    frame = np.asarray(event_frame, dtype=np.float32)
 
-    cv2.circle(im_bgr, (px, py), circle_r, color, circle_thick)
-    cv2.arrowedLine(im_bgr, (cx, cy), (px, py), color, arrow_thick, tipLength=tip_length)
-    return im_bgr
+    if frame.ndim != 2:
+        raise ValueError(f"Expected HxW event frame. Got {frame.shape}.")
+
+    height, width = frame.shape
+    saliency = np.zeros((height, width), dtype=np.float32)
+
+    for scale_idx in range(int(num_pyr)):
+        scale = 1.0 + float(scale_idx)
+
+        center_sigma_s = max(float(center_sigma) * scale, 0.5)
+        surround_sigma_s = max(
+            float(surround_sigma) * scale,
+            center_sigma_s + 0.5,
+        )
+
+        center = cv2.GaussianBlur(frame, (0, 0), center_sigma_s)
+        surround = cv2.GaussianBlur(frame, (0, 0), surround_sigma_s)
+
+        diff = center - surround
+        diff[diff < 0] = 0.0
+
+        saliency += diff
+
+    if rng is None:
+        rng = np.random.default_rng()
+
+    smax = float(saliency.max())
+
+    if smax <= 0:
+        saliency_norm = np.zeros_like(saliency, dtype=np.float32)
+        prob_map = np.full(
+            (height, width),
+            1.0 / float(height * width),
+            dtype=np.float32,
+        )
+
+        flat_idx = int(rng.choice(prob_map.size, p=prob_map.reshape(-1)))
+        peak_y, peak_x = np.unravel_index(flat_idx, prob_map.shape)
+
+        return saliency_norm, (int(peak_x), int(peak_y)), prob_map
+
+    saliency_norm = saliency / (smax + 1e-12)
+
+    logits = float(beta) * saliency_norm
+    logits = logits - float(logits.max())
+
+    exp_logits = np.exp(logits).astype(np.float32)
+    prob_map = exp_logits / (float(exp_logits.sum()) + 1e-12)
+
+    flat_idx = int(rng.choice(prob_map.size, p=prob_map.reshape(-1)))
+    peak_y, peak_x = np.unravel_index(flat_idx, prob_map.shape)
+
+    return saliency_norm.astype(np.float32), (int(peak_x), int(peak_y)), prob_map
 
 
-def make_attention_debug_panel(raw_frame_u8, saliency_map_f32, probs_map, object_mask, peak_x, peak_y):
+def run_attention_black_gaussian_dataset(
+    events_npy: str | Path,
+    output_dir: str | Path,
+    resolution: tuple[int, int] | None = None,
+    attention_params: dict | None = None,
+    window_period_ms: float = 10.0,
+    sigma: float | None = None,
+    max_windows: int | None = None,
+    use_polarity: bool = False,
+    clear_existing: bool = True,
+    image_prefix: str = "roi",
+) -> dict:
     """
-    Construye un panel horizontal con:
-      1) events window
-      2) saliency map
-      3) probability map
-      4) object mask
+    Fully offline attention + black Gaussian foveation dataset generation.
 
-    Mantiene los colores originales y las flechas.
-    Añade la silueta de la máscara sobre events, saliency y probs.
-    Devuelve imagen BGR lista para guardar o mostrar.
+    Pipeline:
+        events.npy
+            -> temporal event windows
+            -> accumulated event window
+            -> multiscale center-surround saliency
+            -> softmax(beta * saliency)
+            -> sample saliency/fixation point
+            -> black Gaussian foveation centered on sampled saliency point
+            -> save fov/roi_00000.png, fov/roi_00001.png, ...
+            -> save saccades.dat
+
+    Output layout:
+        output_dir/
+            fov/
+                roi_00000.png
+                roi_00001.png
+                ...
+            saccades.dat
+
+    saccades.dat columns:
+        idx time_s pre_x pre_y post_x post_y dx dy
     """
-    if not isinstance(raw_frame_u8, np.ndarray):
-        raw_frame_u8 = np.asarray(raw_frame_u8)
-    if raw_frame_u8.dtype != np.uint8:
-        raw_frame_u8 = np.clip(raw_frame_u8, 0, 255).astype(np.uint8)
+    events_npy = Path(events_npy)
+    output_dir = Path(output_dir)
 
-    H, W = raw_frame_u8.shape[:2]
+    fov_dir = output_dir / "fov"
+    saccades_path = output_dir / "saccades.dat"
 
-    # ----------------------------
-    # Prepare mask
-    # ----------------------------
-    if object_mask is None:
-        mask_bin = np.zeros((H, W), dtype=np.uint8)
-    else:
-        if not isinstance(object_mask, np.ndarray):
-            object_mask = np.asarray(object_mask)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    fov_dir.mkdir(parents=True, exist_ok=True)
 
-        if object_mask.shape[:2] != (H, W):
-            mask_bin = cv2.resize(
-                (object_mask > 0).astype(np.uint8),
-                (W, H),
-                interpolation=cv2.INTER_NEAREST
-            )
+    if clear_existing:
+        for old_path in fov_dir.glob(f"{image_prefix}_*.png"):
+            old_path.unlink()
+
+        if saccades_path.exists():
+            saccades_path.unlink()
+
+    merged_params = dict(DEFAULT_ATTENTION_PARAMS)
+    if attention_params is not None:
+        merged_params.update(attention_params)
+
+    rng = np.random.default_rng(int(merged_params.get("seed", 0)))
+
+    events = np.load(events_npy)
+
+    windows, window_times_s, (height, width) = _build_event_windows(
+        events=events,
+        resolution=resolution,
+        window_period_ms=window_period_ms,
+        max_windows=max_windows,
+        use_polarity=use_polarity,
+    )
+
+    if sigma is None:
+        sigma = max(1.0, 0.10 * float(min(height, width)))
+
+    saccades = []
+    fov_paths = []
+
+    previous_peak: tuple[int, int] | None = None
+
+    for idx, (window_frame, time_s) in enumerate(zip(windows, window_times_s)):
+        _, (peak_x, peak_y), _ = compute_saliency_map(
+            window_frame,
+            center_sigma=merged_params.get("center_sigma", 2.0),
+            surround_sigma=merged_params.get("surround_sigma", 8.0),
+            num_pyr=merged_params.get("num_pyr", 6),
+            beta=merged_params.get("beta", 10.0),
+            rng=rng,
+        )
+
+        fov_black = foveate_black_gray(
+            window_frame,
+            center_x=peak_x,
+            center_y=peak_y,
+            sigma=float(sigma),
+        )
+
+        fov_path = fov_dir / f"{image_prefix}_{idx:05d}.png"
+        ok = cv2.imwrite(str(fov_path), fov_black)
+
+        if not ok:
+            raise RuntimeError(f"Could not write foveation image: {fov_path}")
+
+        fov_paths.append(str(fov_path))
+
+        if previous_peak is None:
+            pre_x, pre_y = peak_x, peak_y
+            dx, dy = 0.0, 0.0
         else:
-            mask_bin = (object_mask > 0).astype(np.uint8)
+            pre_x, pre_y = previous_peak
+            dx = float(peak_x - pre_x)
+            dy = float(peak_y - pre_y)
 
-    contours, _ = cv2.findContours(mask_bin, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        saccades.append(
+            [
+                int(idx),
+                float(time_s),
+                int(pre_x),
+                int(pre_y),
+                int(peak_x),
+                int(peak_y),
+                float(dx),
+                float(dy),
+            ]
+        )
 
-    # ----------------------------
-    # Events window
-    # ----------------------------
-    events_vis = cv2.applyColorMap(raw_frame_u8, cv2.COLORMAP_JET)
-    if len(contours) > 0:
-        cv2.drawContours(events_vis, contours, -1, (255, 255, 255), 1)
-    events_vis = draw_peak_arrow(events_vis, peak_x, peak_y, color=(255, 255, 255))
-    cv2.putText(events_vis, "Events", (10, 25),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 255), 1, cv2.LINE_AA)
+        previous_peak = (peak_x, peak_y)
 
-    # ----------------------------
-    # Saliency map
-    # ----------------------------
-    sal_u8 = cv2.normalize(saliency_map_f32, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
+    saccades_arr = np.asarray(saccades, dtype=np.float64)
+
+    header = "idx time_s pre_x pre_y post_x post_y dx dy"
+    np.savetxt(
+        saccades_path,
+        saccades_arr,
+        fmt=[
+            "%d",
+            "%.9f",
+            "%d",
+            "%d",
+            "%d",
+            "%d",
+            "%.6f",
+            "%.6f",
+        ],
+        header=header,
+        comments="",
+    )
+
+    return {
+        "output_dir": str(output_dir),
+        "fov_dir": str(fov_dir),
+        "saccades_path": str(saccades_path),
+        "num_foveations": int(len(fov_paths)),
+        "resolution": (int(height), int(width)),
+        "sigma": float(sigma),
+        "beta": float(merged_params.get("beta", 10.0)),
+        "window_period_ms": float(window_period_ms),
+        "fov_paths": fov_paths,
+    }
+
+
+def foveations_to_gif(
+    fov_dir: str | Path,
+    output_gif: str | Path,
+    fps: int = 20,
+    loop: int = 0,
+    image_prefix: str = "roi",
+) -> str:
+    """
+    Create a GIF from saved foveation images.
+
+    This is only for display or inspection.
+    It is not part of the dataset output.
+
+    loop=0 means loop indefinitely.
+    """
+    from PIL import Image
+
+    fov_dir = Path(fov_dir)
+    output_gif = Path(output_gif)
+
+    output_gif.parent.mkdir(parents=True, exist_ok=True)
+
+    frame_paths = sorted(fov_dir.glob(f"{image_prefix}_*.png"))
+
+    if len(frame_paths) == 0:
+        raise RuntimeError(f"No foveation images found in {fov_dir}")
+
+    frames = [
+        Image.open(frame_path).convert("P", palette=Image.Palette.ADAPTIVE)
+        for frame_path in frame_paths
+    ]
+
+    duration_ms = int(round(1000.0 / float(fps)))
+
+    frames[0].save(
+        output_gif,
+        save_all=True,
+        append_images=frames[1:],
+        duration=duration_ms,
+        loop=int(loop),
+        optimize=True,
+    )
+
+    for frame in frames:
+        frame.close()
+
+    return str(output_gif)
+
+
+def _normalise_to_uint8(x: np.ndarray) -> np.ndarray:
+    """
+    Normalize numeric array to uint8 [0, 255].
+    """
+    x = np.asarray(x, dtype=np.float32)
+    x = np.nan_to_num(x, nan=0.0, posinf=0.0, neginf=0.0)
+
+    xmin = float(x.min())
+    xmax = float(x.max())
+
+    if xmax <= xmin:
+        return np.zeros_like(x, dtype=np.uint8)
+
+    y = 255.0 * (x - xmin) / (xmax - xmin)
+    return np.clip(y, 0, 255).astype(np.uint8)
+
+
+def _make_saliency_display_panel(
+    saliency_map: np.ndarray,
+    peak_x: int,
+    peak_y: int,
+) -> np.ndarray:
+    """
+    Saliency map panel for display only.
+    """
+    sal_u8 = _normalise_to_uint8(saliency_map)
+
     cmap = getattr(cv2, "COLORMAP_PARULA", cv2.COLORMAP_VIRIDIS)
-    sal_vis = cv2.applyColorMap(sal_u8, cmap)
-    if len(contours) > 0:
-        cv2.drawContours(sal_vis, contours, -1, (255, 255, 255), 1)
-    sal_vis = draw_peak_arrow(sal_vis, peak_x, peak_y, color=(255, 255, 255))
-    cv2.putText(sal_vis, "Saliency", (10, 25),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 255), 1, cv2.LINE_AA)
+    panel = cv2.applyColorMap(sal_u8, cmap)
 
-    # ----------------------------
-    # Probability map
-    # ----------------------------
-    if not isinstance(probs_map, np.ndarray):
-        probs_map = np.asarray(probs_map)
-    if probs_map.dtype != np.uint8:
-        probs_u8 = cv2.normalize(probs_map, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
-    else:
-        probs_u8 = probs_map
+    cv2.circle(
+        panel,
+        (int(peak_x), int(peak_y)),
+        5,
+        (255, 255, 255),
+        1,
+    )
 
-    prob_vis = cv2.applyColorMap(probs_u8, cv2.COLORMAP_HOT)
-    if len(contours) > 0:
-        cv2.drawContours(prob_vis, contours, -1, (255, 255, 255), 1)
-    prob_vis = draw_peak_arrow(prob_vis, peak_x, peak_y, color=(255, 255, 255))
-    cv2.putText(prob_vis, "Probs", (10, 25),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 255), 1, cv2.LINE_AA)
+    cv2.putText(
+        panel,
+        "saliency",
+        (5, 16),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.45,
+        (255, 255, 255),
+        1,
+        cv2.LINE_AA,
+    )
 
-    # ----------------------------
-    # Mask panel
-    # ----------------------------
-    mask_u8 = (mask_bin * 255).astype(np.uint8)
-    mask_vis = cv2.cvtColor(mask_u8, cv2.COLOR_GRAY2BGR)
-    if len(contours) > 0:
-        cv2.drawContours(mask_vis, contours, -1, (255, 255, 255), 1)
-    mask_vis = draw_peak_arrow(mask_vis, peak_x, peak_y, color=(255, 255, 255))
-    cv2.putText(mask_vis, "Mask", (10, 25),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 255), 1, cv2.LINE_AA)
-
-    panel = np.hstack([events_vis, sal_vis, prob_vis, mask_vis])
     return panel
 
 
-def save_attention_debug(panel_bgr, out_path, show=False, win_name="Attention debug"):
-    cv2.imwrite(str(out_path), panel_bgr)
-    if show:
-        cv2.imshow(win_name, panel_bgr)
-        cv2.waitKey(1)
+def _make_window_action_display_panel(
+    window_frame: np.ndarray,
+    pre_x: int,
+    pre_y: int,
+    post_x: int,
+    post_y: int,
+) -> np.ndarray:
+    """
+    Accumulated event-window panel with green action vector.
+
+    The vector goes from previous saliency point to current saliency point:
+        (pre_x, pre_y) -> (post_x, post_y)
+    """
+    window_u8 = np.asarray(window_frame, dtype=np.uint8)
+    panel = cv2.cvtColor(window_u8, cv2.COLOR_GRAY2BGR)
+
+    green = (20, 255, 57)  # BGR phosphor green
+
+    cv2.arrowedLine(
+        panel,
+        (int(pre_x), int(pre_y)),
+        (int(post_x), int(post_y)),
+        green,
+        2,
+        cv2.LINE_AA,
+        tipLength=0.25,
+    )
+
+    cv2.circle(
+        panel,
+        (int(pre_x), int(pre_y)),
+        3,
+        green,
+        -1,
+    )
+
+    cv2.circle(
+        panel,
+        (int(post_x), int(post_y)),
+        5,
+        (255, 255, 255),
+        1,
+    )
+
+    cv2.putText(
+        panel,
+        "accumulated window + action",
+        (5, 16),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.40,
+        green,
+        1,
+        cv2.LINE_AA,
+    )
+
+    return panel
+
+
+def make_saliency_window_action_gif(
+    events_npy: str | Path,
+    saccades_path: str | Path,
+    output_gif: str | Path,
+    resolution: tuple[int, int] | None = None,
+    attention_params: dict | None = None,
+    window_period_ms: float = 10.0,
+    max_windows: int | None = None,
+    use_polarity: bool = False,
+    fps: int = 20,
+    loop: int = 0,
+) -> str:
+    """
+    Display-only GIF.
+
+    Creates:
+        saliency map | accumulated event window + action vector
+
+    This does not write dataset outputs.
+    It only creates a GIF for notebook inspection.
+
+    The action vector is read from saccades.dat:
+        pre_x, pre_y -> post_x, post_y
+    """
+    from PIL import Image
+
+    events_npy = Path(events_npy)
+    saccades_path = Path(saccades_path)
+    output_gif = Path(output_gif)
+
+    output_gif.parent.mkdir(parents=True, exist_ok=True)
+
+    merged_params = dict(DEFAULT_ATTENTION_PARAMS)
+    if attention_params is not None:
+        merged_params.update(attention_params)
+
+    rng = np.random.default_rng(int(merged_params.get("seed", 0)))
+
+    events = np.load(events_npy)
+
+    windows, _, (height, width) = _build_event_windows(
+        events=events,
+        resolution=resolution,
+        window_period_ms=window_period_ms,
+        max_windows=max_windows,
+        use_polarity=use_polarity,
+    )
+
+    if not saccades_path.exists():
+        raise FileNotFoundError(f"saccades.dat not found: {saccades_path}")
+
+    saccades = np.loadtxt(
+        saccades_path,
+        skiprows=1,
+        dtype=np.float64,
+    )
+
+    if saccades.ndim == 1:
+        saccades = saccades[None, :]
+
+    n = min(len(windows), saccades.shape[0])
+
+    frames = []
+
+    for idx in range(n):
+        window_frame = windows[idx]
+
+        saliency_map, (peak_x, peak_y), _ = compute_saliency_map(
+            window_frame,
+            center_sigma=merged_params.get("center_sigma", 2.0),
+            surround_sigma=merged_params.get("surround_sigma", 8.0),
+            num_pyr=merged_params.get("num_pyr", 6),
+            beta=merged_params.get("beta", 10.0),
+            rng=rng,
+        )
+
+        # saccades.dat columns:
+        # idx time_s pre_x pre_y post_x post_y dx dy
+        pre_x = int(round(saccades[idx, 2]))
+        pre_y = int(round(saccades[idx, 3]))
+        post_x = int(round(saccades[idx, 4]))
+        post_y = int(round(saccades[idx, 5]))
+
+        saliency_panel = _make_saliency_display_panel(
+            saliency_map=saliency_map,
+            peak_x=peak_x,
+            peak_y=peak_y,
+        )
+
+        window_action_panel = _make_window_action_display_panel(
+            window_frame=window_frame,
+            pre_x=pre_x,
+            pre_y=pre_y,
+            post_x=post_x,
+            post_y=post_y,
+        )
+
+        composite_bgr = np.concatenate(
+            [
+                saliency_panel,
+                window_action_panel,
+            ],
+            axis=1,
+        )
+
+        composite_rgb = cv2.cvtColor(composite_bgr, cv2.COLOR_BGR2RGB)
+        frames.append(Image.fromarray(composite_rgb))
+
+    if len(frames) == 0:
+        blank = np.zeros((height, width * 2, 3), dtype=np.uint8)
+        frames = [Image.fromarray(blank)]
+
+    duration_ms = int(round(1000.0 / float(fps)))
+
+    frames[0].save(
+        output_gif,
+        save_all=True,
+        append_images=frames[1:],
+        duration=duration_ms,
+        loop=int(loop),
+        optimize=True,
+    )
+
+    for frame in frames:
+        frame.close()
+
+    return str(output_gif)
