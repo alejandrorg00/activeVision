@@ -1,17 +1,17 @@
 {
-  "object_path": "h:\\Desktop\\Github\\activeVision\\data\\airplane_010.blend",
-  "output_dir": "h:\\Desktop\\Github\\activeVision\\data\\renders\\airplane_demo\\motion_sequence",
+  "object_path": "c:\\Users\\User\\Desktop\\Github\\activeVision\\data\\airplane_010.blend",
+  "output_dir": "c:\\Users\\User\\Desktop\\Github\\activeVision\\data\\renders\\airplane_demo\\motion_sequence",
   "num_frames": 120,
   "fps": 60,
-  "resolution": 128,
-  "samples": 16,
-  "object_target_size": 1.2,
-  "object_azimuth_deg": 0.0,
-  "object_elevation_deg": 0.0,
+  "resolution": 256,
+  "samples": 128,
+  "object_target_size": 0.45,
+  "object_azimuth_deg": 315.0,
+  "object_elevation_deg": 30.0,
   "camera_position": [
     0.0,
-    -4.0,
-    1.8
+    -0.25,
+    1.5
   ],
   "camera_target": [
     0.0,
@@ -21,12 +21,12 @@
   "focal_length": 50.0,
   "sensor_width_mm": 32.0,
   "light_location": [
-    2.5,
-    -2.5,
-    4.0
+    0.0,
+    0.0,
+    5.0
   ],
-  "light_size": 5.0,
-  "light_strength": 2000.0,
+  "light_size": 10.0,
+  "light_strength": 50.0,
   "drift_sigma_deg": [
     0.003,
     0.003

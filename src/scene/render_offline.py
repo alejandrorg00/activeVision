@@ -3,6 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 import csv
 import json
+import sys
 
 import bpy
 
@@ -49,7 +50,12 @@ def setup_object_scene(
     )
 
     obj = import_largest_mesh_from_blend(object_path)
-    obj = center_and_scale_object(obj, target_size=object_target_size)
+
+    obj = center_and_scale_object(
+        obj,
+        target_size=object_target_size,
+    )
+
     obj = rotate_object(
         obj,
         azimuth_deg=object_azimuth_deg,
@@ -67,6 +73,7 @@ def setup_object_scene(
         focal_length=focal_length,
         sensor_width_mm=sensor_width_mm,
     )
+
     look_at(cam, target=camera_target)
 
     return scene, obj, cam, light
@@ -90,7 +97,7 @@ def render_still(
     light_strength: float = 2000.0,
 ) -> dict:
     """
-    Render a single still image to verify object placement, lighting and camera.
+    Render a single still image.
     """
     output_path = Path(output_path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -151,11 +158,12 @@ def render_camera_motion_sequence(
     """
     Render RGB frames with camera drift, microsaccades and jitter.
 
-    This function does not generate DVS events.
-    It only saves RGB frames and camera metadata.
+    This only saves RGB frames and camera metadata.
+    DVS conversion is done later from the saved PNG frames.
     """
     output_dir = Path(output_dir)
     frames_dir = output_dir / "frames"
+
     output_dir.mkdir(parents=True, exist_ok=True)
     frames_dir.mkdir(parents=True, exist_ok=True)
 
@@ -264,44 +272,444 @@ def render_camera_motion_sequence(
     }
 
 
-def frames_to_video(
+def frames_to_gif(
     frames_dir: str | Path,
-    output_video: str | Path,
-    fps: int = 60,
+    output_gif: str | Path,
+    fps: int = 30,
+    loop: int = 0,
 ) -> str:
     """
-    Convert rendered PNG frames to an mp4 video.
+    Convert rendered PNG frames to an animated GIF.
+
+    loop=0 means loop indefinitely.
     """
-    import cv2
+    from PIL import Image
 
     frames_dir = Path(frames_dir)
-    output_video = Path(output_video)
-    output_video.parent.mkdir(parents=True, exist_ok=True)
+    output_gif = Path(output_gif)
+    output_gif.parent.mkdir(parents=True, exist_ok=True)
 
-    frames = sorted(frames_dir.glob("frame_*.png"))
+    frame_paths = sorted(frames_dir.glob("frame_*.png"))
 
-    if len(frames) == 0:
+    if len(frame_paths) == 0:
         raise RuntimeError(f"No frames found in {frames_dir}")
 
-    first = cv2.imread(str(frames[0]))
-    if first is None:
-        raise RuntimeError(f"Could not read first frame: {frames[0]}")
+    frames = [
+        Image.open(frame_path).convert("P", palette=Image.Palette.ADAPTIVE)
+        for frame_path in frame_paths
+    ]
 
-    height, width = first.shape[:2]
+    duration_ms = int(round(1000.0 / float(fps)))
 
-    writer = cv2.VideoWriter(
-        str(output_video),
-        cv2.VideoWriter_fourcc(*"mp4v"),
-        float(fps),
-        (width, height),
+    frames[0].save(
+        output_gif,
+        save_all=True,
+        append_images=frames[1:],
+        duration=duration_ms,
+        loop=int(loop),
+        optimize=True,
     )
 
-    for frame_path in frames:
-        img = cv2.imread(str(frame_path))
-        if img is None:
-            raise RuntimeError(f"Could not read frame: {frame_path}")
-        writer.write(img)
+    for frame in frames:
+        frame.close()
 
-    writer.release()
+    return str(output_gif)
 
-    return str(output_video)
+
+def _add_iebcs_lux_to_path() -> Path:
+    """
+    Add ./src/IEBCS/lux to sys.path.
+
+    This assumes this file is:
+        ./src/scene/render_offline.py
+
+    Therefore:
+        src_dir = ./src
+        lux_dir = ./src/IEBCS/lux
+    """
+    this_file = Path(__file__).resolve()
+    src_dir = this_file.parents[1]
+    lux_dir = src_dir / "IEBCS" / "lux"
+
+    if not lux_dir.exists():
+        raise FileNotFoundError(
+            f"Could not find IEBCS lux directory at: {lux_dir}\n"
+            "Expected path: ./src/IEBCS/lux"
+        )
+
+    lux_dir_str = str(lux_dir)
+    if lux_dir_str not in sys.path:
+        sys.path.insert(0, lux_dir_str)
+
+    return lux_dir
+
+
+def _read_frame_luminance_klux(frame_path: str | Path):
+    """
+    Read a rendered RGB frame and convert it to the luminance signal expected
+    by the IEBCS DVS code.
+
+    Convention from your original script:
+        uint8 255 -> 1e4
+
+    In other words:
+        L = L_channel / 255 * 1e4
+
+    The name says klux because this is the same luminance scaling used by the
+    IEBCS example code.
+    """
+    import cv2
+    import numpy as np
+
+    frame_path = Path(frame_path)
+
+    img = cv2.imread(str(frame_path), cv2.IMREAD_COLOR)
+    if img is None:
+        raise RuntimeError(f"Could not read frame: {frame_path}")
+
+    # OpenCV reads BGR. Convert to LUV and use the L channel.
+    luv = cv2.cvtColor(img, cv2.COLOR_BGR2LUV)
+    lum = luv[:, :, 0].astype(np.float32) / 255.0 * 1e4
+
+    return lum
+
+
+def _events_from_dat_to_npy(
+    dat_path: str | Path,
+    output_npy: str | Path,
+) -> str:
+    """
+    Convert IEBCS .dat events to .npy.
+
+    Output array shape:
+        (N, 4)
+
+    Columns:
+        x, y, polarity, timestamp_seconds
+    """
+    import numpy as np
+
+    _add_iebcs_lux_to_path()
+    from dat_files import load_dat_event
+
+    dat_path = Path(dat_path)
+    output_npy = Path(output_npy)
+    output_npy.parent.mkdir(parents=True, exist_ok=True)
+
+    ts, x, y, p = load_dat_event(str(dat_path))
+
+    timestamps_sec = ts.astype(np.float64) * 1e-6
+    x = x.astype(np.int32)
+    y = y.astype(np.int32)
+    p = p.astype(np.int32)
+
+    data = np.stack([x, y, p, timestamps_sec], axis=1)
+    np.save(output_npy, data)
+
+    return str(output_npy)
+
+
+def _dat_to_event_gif(
+    dat_path: str | Path,
+    output_gif: str | Path,
+    res: tuple[int, int],
+    window_us: int = 1000,
+    gif_fps: int = 20,
+    loop: int = 0,
+    timestamp_text: bool = True,
+) -> str:
+    """
+    Convert IEBCS .dat events to an animated GIF.
+
+    loop=0 means infinite looping.
+
+    res:
+        (width, height)
+    """
+    import cv2
+    import numpy as np
+    from PIL import Image
+
+    _add_iebcs_lux_to_path()
+    from dat_files import load_dat_event
+
+    dat_path = Path(dat_path)
+    output_gif = Path(output_gif)
+    output_gif.parent.mkdir(parents=True, exist_ok=True)
+
+    ts, x, y, p = load_dat_event(str(dat_path))
+
+    width, height = int(res[0]), int(res[1])
+
+    if ts.size == 0:
+        blank = np.full((height, width, 3), 125, dtype=np.uint8)
+        pil = Image.fromarray(blank)
+        pil.save(
+            output_gif,
+            save_all=True,
+            append_images=[],
+            duration=int(round(1000.0 / float(gif_fps))),
+            loop=int(loop),
+        )
+        pil.close()
+        return str(output_gif)
+
+    frames = []
+
+    img = np.zeros((height, width), dtype=np.float32)
+    tsurface = np.zeros((height, width), dtype=np.int64)
+    indsurface = np.zeros((height, width), dtype=np.int8)
+
+    t0 = int(ts[0])
+    t1 = int(ts[-1])
+
+    duration_ms = int(round(1000.0 / float(gif_fps)))
+    decay_tau = max(float(window_us) / 30.0, 1.0)
+
+    for t in range(t0, t1 + 1, int(window_us)):
+        ind = (ts >= t) & (ts < t + window_us)
+
+        tsurface[:, :] = 0
+        indsurface[:, :] = 0
+
+        if ind.any():
+            tsurface[y[ind], x[ind]] = t + window_us
+            indsurface[y[ind], x[ind]] = 2 * p[ind].astype(np.int8) - 1
+
+        img[:, :] = 125.0
+        active = tsurface > 0
+
+        if active.any():
+            img[active] = 125.0 + indsurface[active] * np.exp(
+                -(t + window_us - tsurface[active].astype(np.float32)) / decay_tau
+            ) * 125.0
+
+        gray = np.clip(img, 0, 255).astype(np.uint8)
+        color = cv2.cvtColor(gray, cv2.COLOR_GRAY2BGR)
+
+        if timestamp_text:
+            color = cv2.putText(
+                color,
+                f"{t + window_us} us",
+                (4, 18),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.5,
+                (255, 255, 255),
+                1,
+                cv2.LINE_AA,
+            )
+
+        color = cv2.applyColorMap(color, cv2.COLORMAP_VIRIDIS)
+        color = cv2.cvtColor(color, cv2.COLOR_BGR2RGB)
+
+        frames.append(Image.fromarray(color))
+
+    frames[0].save(
+        output_gif,
+        save_all=True,
+        append_images=frames[1:],
+        duration=duration_ms,
+        loop=int(loop),
+        optimize=True,
+    )
+
+    for frame in frames:
+        frame.close()
+
+    return str(output_gif)
+
+
+def frames_to_events_npy_and_gif(
+    frames_dir: str | Path,
+    output_dir: str | Path,
+    fps: int,
+    th_pos: float = 0.15,
+    th_neg: float = 0.15,
+    th_noise: float = 0.05,
+    lat: int = 500,
+    tau: int = 300,
+    jit: int = 100,
+    bgnp: float = 0.0001,
+    bgnn: float = 0.0001,
+    ref: int = 40,
+    skip_frames: int = 0,
+    noise_pos: str | Path | None = None,
+    noise_neg: str | Path | None = None,
+    gif_fps: int = 20,
+    gif_window_us: int | None = None,
+    loop: int = 0,
+    timestamp_text: bool = True,
+    keep_dat: bool = True,
+) -> dict:
+    """
+    Convert rendered PNG frames to IEBCS DVS events.
+
+    Outputs:
+        events.dat
+        events.npy
+        events.gif
+
+    This is still offline:
+        rendered PNG frames -> DVS conversion -> npy/gif
+
+    It uses the IEBCS DVS code located at:
+        ./src/IEBCS/lux
+
+    The .npy format is:
+        columns = [x, y, polarity, timestamp_seconds]
+
+    Parameters
+    ----------
+    frames_dir:
+        Directory containing rendered frames named frame_*.png.
+
+    output_dir:
+        Directory where event outputs are saved.
+
+    fps:
+        Frame rate of the rendered sequence.
+
+    th_pos, th_neg:
+        ON/OFF thresholds.
+
+    th_noise:
+        Threshold noise.
+
+    lat:
+        Latency in microseconds.
+
+    tau:
+        Front-end time constant in microseconds.
+
+    jit:
+        Temporal jitter standard deviation in microseconds.
+
+    bgnp, bgnn:
+        ON/OFF background event noise rates.
+
+    ref:
+        Refractory period in microseconds.
+
+    skip_frames:
+        Number of initial RGB frames to skip before initializing the DVS.
+
+    gif_fps:
+        Playback fps for the event GIF.
+
+    gif_window_us:
+        Temporal event accumulation window for the GIF.
+        If None, uses dt_us = 1e6 / fps.
+
+    loop:
+        GIF loop setting. 0 means infinite loop.
+
+    keep_dat:
+        If False, deletes events.dat after creating events.npy and events.gif.
+    """
+    _add_iebcs_lux_to_path()
+
+    from event_buffer import EventBuffer
+    from dvs_sensor import DvsSensor
+
+    frames_dir = Path(frames_dir)
+    output_dir = Path(output_dir)
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    frame_paths = sorted(frames_dir.glob("frame_*.png"))
+
+    if len(frame_paths) < 2:
+        raise RuntimeError(f"Need at least 2 frames in {frames_dir} to generate events.")
+
+    if fps <= 0:
+        raise ValueError("fps must be > 0")
+
+    if skip_frames < 0:
+        raise ValueError("skip_frames must be >= 0")
+
+    if skip_frames >= len(frame_paths) - 1:
+        raise ValueError(
+            f"skip_frames={skip_frames} is too large for {len(frame_paths)} frames."
+        )
+
+    dt_us = int(round(1e6 / float(fps)))
+
+    if gif_window_us is None:
+        gif_window_us = dt_us
+
+    init_frame_path = frame_paths[skip_frames]
+    init_im = _read_frame_luminance_klux(init_frame_path)
+
+    height, width = init_im.shape[:2]
+
+    dvs = DvsSensor("OfflineDVS")
+
+    dvs.initCamera(
+        int(width),
+        int(height),
+        lat=int(lat),
+        jit=int(jit),
+        ref=int(ref),
+        tau=int(tau),
+        th_pos=float(th_pos),
+        th_neg=float(th_neg),
+        th_noise=float(th_noise),
+        bgnp=float(bgnp),
+        bgnn=float(bgnn),
+    )
+
+    if noise_pos is not None and noise_neg is not None:
+        dvs.init_bgn_hist(str(noise_pos), str(noise_neg))
+
+    dvs.init_image(init_im)
+
+    ev_full = EventBuffer(1)
+
+    for frame_path in frame_paths[skip_frames + 1:]:
+        im = _read_frame_luminance_klux(frame_path)
+        ev = dvs.update(im, dt_us)
+        ev_full.increase_ev(ev)
+
+    dat_path = output_dir / "events.dat"
+    npy_path = output_dir / "events.npy"
+    gif_path = output_dir / "events.gif"
+
+    ev_full.write(str(dat_path))
+
+    _events_from_dat_to_npy(
+        dat_path=dat_path,
+        output_npy=npy_path,
+    )
+
+    _dat_to_event_gif(
+        dat_path=dat_path,
+        output_gif=gif_path,
+        res=(width, height),
+        window_us=int(gif_window_us),
+        gif_fps=int(gif_fps),
+        loop=int(loop),
+        timestamp_text=timestamp_text,
+    )
+
+    if not keep_dat:
+        dat_path.unlink(missing_ok=True)
+
+    return {
+        "dat_path": str(dat_path) if keep_dat else None,
+        "npy_path": str(npy_path),
+        "gif_path": str(gif_path),
+        "frames_dir": str(frames_dir),
+        "fps": int(fps),
+        "dt_us": int(dt_us),
+        "width": int(width),
+        "height": int(height),
+        "th_pos": float(th_pos),
+        "th_neg": float(th_neg),
+        "th_noise": float(th_noise),
+        "lat": int(lat),
+        "tau": int(tau),
+        "jit": int(jit),
+        "bgnp": float(bgnp),
+        "bgnn": float(bgnn),
+        "ref": int(ref),
+    }
