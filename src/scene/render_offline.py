@@ -18,7 +18,7 @@ from scene.blender_scene import (
     look_at,
 )
 
-from scene.camera_motion import MicrosaccadeCameraController
+from scene.camera_motion import DriftCameraController
 
 
 def setup_object_scene(
@@ -148,17 +148,25 @@ def render_camera_motion_sequence(
     light_size: float = 5.0,
     light_strength: float = 2000.0,
     drift_sigma_deg=(0.005, 0.005),
-    microsaccade_rate_hz: float = 5.0,
-    microsaccade_amp_deg=(0.05, 0.30),
-    microsaccade_dur_ms=(10, 30),
     seed: int = 0,
     save_metadata: bool = True,
 ) -> dict:
     """
-    Render RGB frames with camera drift, microsaccades and jitter.
+    Render RGB frames with drift-only camera motion.
 
     This only saves RGB frames and camera metadata.
     DVS conversion is done later from the saved PNG frames.
+
+    Motion model
+    ------------
+    No microsaccades.
+    No jitter.
+
+    The camera angular drift is accumulated as:
+
+        drift_t = drift_{t-1} + Normal(0, drift_sigma_deg)
+
+    independently for pan and tilt.
     """
     output_dir = Path(output_dir)
     frames_dir = output_dir / "frames"
@@ -186,15 +194,13 @@ def render_camera_motion_sequence(
         light_strength=light_strength,
     )
 
+    cam.rotation_mode = "QUATERNION"
     base_rotation = cam.rotation_quaternion.copy()
 
-    controller = MicrosaccadeCameraController(
+    controller = DriftCameraController(
         camera=cam,
         base_rotation_quaternion=base_rotation,
         drift_sigma_deg=drift_sigma_deg,
-        microsaccade_rate_hz=microsaccade_rate_hz,
-        microsaccade_amp_deg=microsaccade_amp_deg,
-        microsaccade_dur_ms=microsaccade_dur_ms,
         seed=seed,
     )
 
@@ -222,10 +228,11 @@ def render_camera_motion_sequence(
         "light_location": list(light_location),
         "light_size": float(light_size),
         "light_strength": float(light_strength),
-        "drift_sigma_deg": list(drift_sigma_deg),
-        "microsaccade_rate_hz": float(microsaccade_rate_hz),
-        "microsaccade_amp_deg": list(microsaccade_amp_deg),
-        "microsaccade_dur_ms": list(microsaccade_dur_ms),
+        "motion_type": "drift_only",
+        "drift_sigma_deg": [
+            float(drift_sigma_deg[0]),
+            float(drift_sigma_deg[1]),
+        ],
         "seed": int(seed),
     }
 
@@ -243,14 +250,15 @@ def render_camera_motion_sequence(
         bpy.ops.render.render(write_still=True)
 
         row = {
-            "frame": frame_idx,
-            "time_s": frame_idx * dt,
+            "frame": int(frame_idx),
+            "time_s": float(frame_idx * dt),
             "frame_path": str(frame_path),
             "camera_x": float(cam.location.x),
             "camera_y": float(cam.location.y),
             "camera_z": float(cam.location.z),
             **motion_info,
         }
+
         rows.append(row)
 
     if save_metadata and rows:
@@ -266,6 +274,11 @@ def render_camera_motion_sequence(
         "config_path": str(config_path),
         "num_frames": int(num_frames),
         "fps": int(fps),
+        "motion_type": "drift_only",
+        "drift_sigma_deg": [
+            float(drift_sigma_deg[0]),
+            float(drift_sigma_deg[1]),
+        ],
     }
 
 
@@ -336,8 +349,6 @@ def _add_iebcs_lux_to_path() -> tuple[Path, Path]:
     """
     this_file = Path(__file__).resolve()
 
-    # this_file = .../src/scene/render_offline.py
-    # src_dir   = .../src
     src_dir = this_file.parents[1]
 
     iebcs_dir = src_dir / "IEBCS"
@@ -373,9 +384,6 @@ def _read_frame_luminance_klux(frame_path: str | Path):
 
     In other words:
         L = L_channel / 255 * 1e4
-
-    The name says klux because this is the same luminance scaling used by the
-    IEBCS example code.
     """
     import cv2
     import numpy as np
@@ -383,10 +391,10 @@ def _read_frame_luminance_klux(frame_path: str | Path):
     frame_path = Path(frame_path)
 
     img = cv2.imread(str(frame_path), cv2.IMREAD_COLOR)
+
     if img is None:
         raise RuntimeError(f"Could not read frame: {frame_path}")
 
-    # OpenCV reads BGR. Convert to LUV and use the L channel.
     luv = cv2.cvtColor(img, cv2.COLOR_BGR2LUV)
     lum = luv[:, :, 0].astype(np.float32) / 255.0 * 1e4
 
@@ -499,9 +507,15 @@ def _dat_to_event_gif(
         active = tsurface > 0
 
         if active.any():
-            img[active] = 125.0 + indsurface[active] * np.exp(
-                -(t + window_us - tsurface[active].astype(np.float32)) / decay_tau
-            ) * 125.0
+            img[active] = (
+                125.0
+                + indsurface[active]
+                * np.exp(
+                    -(t + window_us - tsurface[active].astype(np.float32))
+                    / decay_tau
+                )
+                * 125.0
+            )
 
         gray = np.clip(img, 0, 255).astype(np.uint8)
         color = cv2.cvtColor(gray, cv2.COLOR_GRAY2BGR)
@@ -576,54 +590,6 @@ def frames_to_events_npy_and_gif(
 
     The .npy format is:
         columns = [x, y, polarity, timestamp_seconds]
-
-    Parameters
-    ----------
-    frames_dir:
-        Directory containing rendered frames named frame_*.png.
-
-    output_dir:
-        Directory where event outputs are saved.
-
-    fps:
-        Frame rate of the rendered sequence.
-
-    th_pos, th_neg:
-        ON/OFF thresholds.
-
-    th_noise:
-        Threshold noise.
-
-    lat:
-        Latency in microseconds.
-
-    tau:
-        Front-end time constant in microseconds.
-
-    jit:
-        Temporal jitter standard deviation in microseconds.
-
-    bgnp, bgnn:
-        ON/OFF background event noise rates.
-
-    ref:
-        Refractory period in microseconds.
-
-    skip_frames:
-        Number of initial RGB frames to skip before initializing the DVS.
-
-    gif_fps:
-        Playback fps for the event GIF.
-
-    gif_window_us:
-        Temporal event accumulation window for the GIF.
-        If None, uses dt_us = 1e6 / fps.
-
-    loop:
-        GIF loop setting. 0 means infinite loop.
-
-    keep_dat:
-        If False, deletes events.dat after creating events.npy and events.gif.
     """
     _add_iebcs_lux_to_path()
 
@@ -641,10 +607,10 @@ def frames_to_events_npy_and_gif(
         raise RuntimeError(f"Need at least 2 frames in {frames_dir} to generate events.")
 
     if fps <= 0:
-        raise ValueError("fps must be > 0")
+        raise ValueError("fps must be > 0.")
 
     if skip_frames < 0:
-        raise ValueError("skip_frames must be >= 0")
+        raise ValueError("skip_frames must be >= 0.")
 
     if skip_frames >= len(frame_paths) - 1:
         raise ValueError(
