@@ -1,3 +1,4 @@
+# Alejandro Rodriguez-Garcia
 from __future__ import annotations
 
 from pathlib import Path
@@ -55,10 +56,7 @@ def foveations_to_gif(
 ) -> str:
     """
     Create a GIF from saved foveation images.
-
-    This is only for notebook display or inspection.
-
-    loop=0 means loop indefinitely.
+    
     """
     from PIL import Image
 
