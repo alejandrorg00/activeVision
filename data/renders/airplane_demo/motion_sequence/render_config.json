@@ -1,7 +1,7 @@
 {
-  "object_path": "c:\\Users\\User\\Desktop\\Github\\activeVision\\data\\airplane_010.blend",
-  "output_dir": "c:\\Users\\User\\Desktop\\Github\\activeVision\\data\\renders\\airplane_demo\\motion_sequence",
-  "num_frames": 100,
+  "object_path": "h:\\Desktop\\Github\\activeVision\\data\\airplane_010.blend",
+  "output_dir": "h:\\Desktop\\Github\\activeVision\\data\\renders\\airplane_demo\\motion_sequence",
+  "num_frames": 500,
   "fps": 1000,
   "resolution": 256,
   "samples": 1,
@@ -11,7 +11,7 @@
   "camera_position": [
     0.0,
     -0.25,
-    1.5
+    2.0
   ],
   "camera_target": [
     0.0,

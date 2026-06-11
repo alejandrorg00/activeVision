@@ -13,10 +13,30 @@ except ImportError:
 
 
 DEFAULT_ATTENTION_PARAMS = {
-    # Multiscale center-surround saliency.
+    # Saliency backend. Options:
+    #   "center_surround" : multiscale centre-surround filtering.
+    #   "lif_vm"          : Von Mises orientation filters + Sinabs LIF neurons.
+    "saliency_backend": "center_surround",
+
+    # Multiscale processing.
     "num_pyr": 6,
+
+    # Centre-surround saliency parameters.
     "center_sigma": 2.0,
     "surround_sigma": 8.0,
+
+    # LIF/Von-Mises saliency parameters.
+    "lif_tau_mem": 10.0,
+    "lif_thetas": None,              # None -> 8 orientations in [0, 2*pi).
+    "lif_size_krn": 31,
+    "lif_rho": 0.1,
+    "lif_r0": 8,
+    "lif_thick": 0.5,
+    "lif_offset": (0, 0),
+    "lif_filter_resize_perc": 1.0,
+    "lif_stride": 1,
+    "lif_device": "auto",          # "auto", "cpu", or "cuda".
+    "lif_stateful": True,            # Keep LIF membrane state across event windows.
 
     # Softmax beta.
     "beta": 10.0,
@@ -129,6 +149,287 @@ def _build_event_windows(
         right += window_period_ms
 
     return windows, window_times_s, (height, width)
+
+
+def _softmax_sample_from_saliency(
+    saliency: np.ndarray,
+    beta: float = 10.0,
+    rng: np.random.Generator | None = None,
+) -> tuple[np.ndarray, tuple[int, int], np.ndarray]:
+    """
+    Normalize a saliency/activity map and sample a fixation from
+    softmax(beta * saliency_norm).
+
+    Returns
+    -------
+    saliency_norm:
+        HxW normalized activity map in [0, 1].
+    fixation:
+        Tuple (x, y) sampled from the softmax probability map.
+    prob_map:
+        HxW probability map.
+    """
+    saliency = np.asarray(saliency, dtype=np.float32)
+
+    if saliency.ndim != 2:
+        raise ValueError(f"Expected HxW saliency map. Got {saliency.shape}.")
+
+    if rng is None:
+        rng = np.random.default_rng()
+
+    height, width = saliency.shape
+    saliency = np.nan_to_num(saliency, nan=0.0, posinf=0.0, neginf=0.0)
+    saliency[saliency < 0] = 0.0
+
+    smax = float(saliency.max())
+
+    if smax <= 0:
+        saliency_norm = np.zeros_like(saliency, dtype=np.float32)
+        prob_map = np.full(
+            (height, width),
+            1.0 / float(height * width),
+            dtype=np.float32,
+        )
+    else:
+        saliency_norm = saliency / (smax + 1e-12)
+        logits = float(beta) * saliency_norm
+        logits = logits - float(logits.max())
+        exp_logits = np.exp(logits).astype(np.float32)
+        prob_map = exp_logits / (float(exp_logits.sum()) + 1e-12)
+
+    flat_idx = int(rng.choice(prob_map.size, p=prob_map.reshape(-1)))
+    peak_y, peak_x = np.unravel_index(flat_idx, prob_map.shape)
+
+    return saliency_norm.astype(np.float32), (int(peak_x), int(peak_y)), prob_map
+
+
+def _zero_2pi_tan(x: float, y: float) -> float:
+    """
+    Angle in [0, 2*pi].
+    """
+    return float(np.arctan2(y, x) % (2.0 * np.pi))
+
+
+def _vm_filter(
+    theta: float,
+    scale: int,
+    rho: float = 0.1,
+    r0: int = 0,
+    thick: float = 0.5,
+    offset: tuple[float, float] = (0, 0),
+) -> np.ndarray:
+    """
+    Generate one Von Mises-like orientation filter.
+    Adapted from the original LIF attention code.
+    """
+    from scipy.special import iv
+
+    height, width = int(scale), int(scale)
+    vm = np.empty((height, width), dtype=np.float32)
+    offset_x, offset_y = offset
+
+    for x in range(width):
+        for y in range(height):
+            X = (x - width / 2.0) + r0 * np.cos(theta) - offset_x * np.cos(theta)
+            Y = (height / 2.0 - y) + r0 * np.sin(theta) - offset_y * np.sin(theta)
+            r = np.sqrt(X**2 + Y**2)
+            angle = _zero_2pi_tan(X, Y)
+            denom = float(iv(0, r - r0)) + 1e-12
+            vm[y, x] = np.exp(float(thick) * float(rho) * float(r0) * np.cos(angle - theta)) / denom
+
+    vm = np.nan_to_num(vm, nan=0.0, posinf=0.0, neginf=0.0).astype(np.float32)
+
+    # Stabilize filter magnitude for Conv2d/LIF.
+    vm = vm - float(vm.mean())
+    vmax = float(np.max(np.abs(vm)))
+    if vmax > 0:
+        vm = vm / vmax
+
+    return vm.astype(np.float32)
+
+
+def _vm_kernels(
+    thetas: np.ndarray,
+    size: int,
+    rho: float,
+    r0: int,
+    thick: float,
+    offset: tuple[float, float],
+    fltr_resize_perc: float,
+) -> np.ndarray:
+    """
+    Create a bank of Von Mises filters with different orientations.
+    Returns array with shape (n_orientations, kernel_h, kernel_w).
+    """
+    filters = []
+
+    for theta in thetas:
+        filt = _vm_filter(
+            theta=float(theta),
+            scale=int(size),
+            rho=float(rho),
+            r0=int(r0),
+            thick=float(thick),
+            offset=offset,
+        )
+
+        if float(fltr_resize_perc) != 1.0:
+            from skimage.transform import rescale
+
+            filt = rescale(
+                filt,
+                float(fltr_resize_perc),
+                anti_aliasing=False,
+                preserve_range=True,
+            ).astype(np.float32)
+
+        filters.append(filt.astype(np.float32))
+
+    # Ensure all kernels have same shape after optional rescaling.
+    min_h = min(f.shape[0] for f in filters)
+    min_w = min(f.shape[1] for f in filters)
+    filters = [f[:min_h, :min_w] for f in filters]
+
+    return np.stack(filters).astype(np.float32)
+
+
+def _get_lif_device(device_name: str):
+    import torch
+
+    if device_name == "auto":
+        return torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    return torch.device(device_name)
+
+
+def _build_lif_vm_attention_net(params: dict):
+    """
+    Build a simple feedforward spiking attention module:
+
+        event window -> Von Mises Conv2d filters -> Sinabs LIF neurons
+
+    The network returns orientation-selective spiking/activity maps.
+    The spatial saliency map is obtained by summing across orientations
+    and pyramid scales.
+    """
+    import torch
+    import torch.nn as nn
+    import sinabs.layers as sl
+
+    device = _get_lif_device(str(params.get("lif_device", "auto")))
+
+    thetas = params.get("lif_thetas", None)
+    if thetas is None:
+        thetas = np.linspace(0.0, 2.0 * np.pi, 8, endpoint=False)
+    else:
+        thetas = np.asarray(thetas, dtype=np.float32)
+
+    kernels = _vm_kernels(
+        thetas=thetas,
+        size=int(params.get("lif_size_krn", 31)),
+        rho=float(params.get("lif_rho", 0.1)),
+        r0=int(params.get("lif_r0", 8)),
+        thick=float(params.get("lif_thick", 0.5)),
+        offset=tuple(params.get("lif_offset", (0, 0))),
+        fltr_resize_perc=float(params.get("lif_filter_resize_perc", 1.0)),
+    )
+
+    kernel_h, kernel_w = int(kernels.shape[-2]), int(kernels.shape[-1])
+    stride = int(params.get("lif_stride", 1))
+
+    conv = nn.Conv2d(
+        in_channels=1,
+        out_channels=int(kernels.shape[0]),
+        kernel_size=(kernel_h, kernel_w),
+        stride=stride,
+        padding=(kernel_h // 2, kernel_w // 2),
+        bias=False,
+    )
+
+    conv.weight.data = torch.tensor(kernels, dtype=torch.float32).unsqueeze(1)
+    conv.weight.requires_grad_(False)
+
+    lif = sl.LIF(tau_mem=float(params.get("lif_tau_mem", 10.0)))
+
+    net = nn.Sequential(conv, lif).to(device)
+    net.eval()
+
+    return net, device
+
+
+def _reset_lif_state(net) -> None:
+    """
+    Reset Sinabs LIF state when supported by the installed version.
+    """
+    for module in net.modules():
+        if hasattr(module, "reset_states"):
+            module.reset_states()
+        elif hasattr(module, "reset_state"):
+            module.reset_state()
+
+
+def compute_lif_vm_saliency_map(
+    event_frame: np.ndarray,
+    net,
+    device,
+    num_pyr: int = 6,
+    beta: float = 10.0,
+    rng: np.random.Generator | None = None,
+    reset_state: bool = False,
+) -> tuple[np.ndarray, tuple[int, int], np.ndarray]:
+    """
+    Compute a saliency map using Von Mises orientation filters followed by
+    Sinabs LIF neurons, then sample a fixation from softmax(beta * saliency).
+
+    This backend makes the saliency map an explicit spiking population
+    activity map rather than a purely image-filtered centre-surround map.
+    """
+    import torch
+    import torch.nn.functional as F
+
+    frame = np.asarray(event_frame, dtype=np.float32)
+
+    if frame.ndim != 2:
+        raise ValueError(f"Expected HxW event frame. Got {frame.shape}.")
+
+    height, width = frame.shape
+
+    # Normalize event window to [0, 1].
+    if float(frame.max()) > 0:
+        frame = frame / (float(frame.max()) + 1e-12)
+
+    x0 = torch.tensor(frame, dtype=torch.float32, device=device)[None, None, :, :]
+    saliency = np.zeros((height, width), dtype=np.float32)
+
+    if reset_state:
+        _reset_lif_state(net)
+
+    with torch.no_grad():
+        for scale_idx in range(int(num_pyr)):
+            scale = 1.0 + float(scale_idx)
+            h_s = max(1, int(round(height / scale)))
+            w_s = max(1, int(round(width / scale)))
+
+            if h_s != height or w_s != width:
+                xs = F.interpolate(x0, size=(h_s, w_s), mode="bilinear", align_corners=False)
+                xs = F.interpolate(xs, size=(height, width), mode="bilinear", align_corners=False)
+            else:
+                xs = x0
+
+            y = net(xs)
+
+            if isinstance(y, (tuple, list)):
+                y = y[0]
+
+            # y shape: [1, n_orientations, H', W'].
+            y_sum = y.sum(dim=1, keepdim=True)
+
+            if y_sum.shape[-2:] != (height, width):
+                y_sum = F.interpolate(y_sum, size=(height, width), mode="bilinear", align_corners=False)
+
+            saliency += y_sum[0, 0].detach().cpu().numpy().astype(np.float32)
+
+    return _softmax_sample_from_saliency(saliency, beta=beta, rng=rng)
 
 
 def compute_saliency_map(
@@ -443,6 +744,23 @@ def run_attention(
     if sigma is None:
         sigma = max(1.0, 0.10 * float(min(height, width)))
 
+    saliency_backend = str(merged_params.get("saliency_backend", "center_surround")).lower()
+
+    lif_net = None
+    lif_device = None
+
+    if saliency_backend in {"lif_vm", "lif", "spiking"}:
+        lif_net, lif_device = _build_lif_vm_attention_net(merged_params)
+        _reset_lif_state(lif_net)
+        print(f"[attention] Using LIF/Von-Mises saliency backend on {lif_device}.")
+    elif saliency_backend in {"center_surround", "cs", "classic"}:
+        print("[attention] Using centre-surround saliency backend.")
+    else:
+        raise ValueError(
+            "Unknown saliency_backend: "
+            f"{saliency_backend}. Use 'center_surround' or 'lif_vm'."
+        )
+
     saccades = []
     fov_paths = []
     plot_frames = []
@@ -450,14 +768,25 @@ def run_attention(
     previous_peak: tuple[int, int] | None = None
 
     for idx, (window_frame, time_s) in enumerate(zip(windows, window_times_s)):
-        saliency_map, (peak_x, peak_y), _ = compute_saliency_map(
-            window_frame,
-            center_sigma=merged_params.get("center_sigma", 2.0),
-            surround_sigma=merged_params.get("surround_sigma", 8.0),
-            num_pyr=merged_params.get("num_pyr", 6),
-            beta=merged_params.get("beta", 10.0),
-            rng=rng,
-        )
+        if saliency_backend in {"lif_vm", "lif", "spiking"}:
+            saliency_map, (peak_x, peak_y), _ = compute_lif_vm_saliency_map(
+                window_frame,
+                net=lif_net,
+                device=lif_device,
+                num_pyr=merged_params.get("num_pyr", 6),
+                beta=merged_params.get("beta", 10.0),
+                rng=rng,
+                reset_state=not bool(merged_params.get("lif_stateful", True)),
+            )
+        else:
+            saliency_map, (peak_x, peak_y), _ = compute_saliency_map(
+                window_frame,
+                center_sigma=merged_params.get("center_sigma", 2.0),
+                surround_sigma=merged_params.get("surround_sigma", 8.0),
+                num_pyr=merged_params.get("num_pyr", 6),
+                beta=merged_params.get("beta", 10.0),
+                rng=rng,
+            )
 
         if previous_peak is None:
             pre_x, pre_y = peak_x, peak_y
