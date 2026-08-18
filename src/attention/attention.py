@@ -38,10 +38,15 @@ DEFAULT_ATTENTION_PARAMS = {
     "lif_device": "auto",          # "auto", "cpu", or "cuda".
     "lif_stateful": True,            # Keep LIF membrane state across event windows.
 
-    # Softmax beta.
+    # Fixation-selection policy. Options:
+    #   "softmax" : stochastic sampling from softmax(beta * saliency_norm).
+    #   "argmax"  : deterministic selection of the maximally salient location.
+    "mode": "softmax",
+
+    # Softmax inverse temperature / attentional gain. Ignored in argmax mode.
     "beta": 10.0,
 
-    # RNG seed for sampling from the softmax map.
+    # RNG seed for stochastic softmax sampling (and the empty-map fallback).
     "seed": 0,
 }
 
@@ -151,28 +156,61 @@ def _build_event_windows(
     return windows, window_times_s, (height, width)
 
 
-def _softmax_sample_from_saliency(
+def _select_fixation_from_saliency(
     saliency: np.ndarray,
+    mode: str = "softmax",
     beta: float = 10.0,
     rng: np.random.Generator | None = None,
 ) -> tuple[np.ndarray, tuple[int, int], np.ndarray]:
     """
-    Normalize a saliency/activity map and sample a fixation from
-    softmax(beta * saliency_norm).
+    Normalize a saliency/activity map and select one fixation.
+
+    Parameters
+    ----------
+    saliency:
+        HxW non-negative saliency/activity map.
+
+    mode:
+        ``"softmax"`` samples stochastically from
+
+            softmax(beta * saliency_norm)
+
+        ``"argmax"`` deterministically selects the maximally salient pixel.
+        In argmax mode, ``beta`` is ignored.
+
+    beta:
+        Softmax inverse temperature / attentional gain.
+
+    rng:
+        Random generator used by softmax sampling.
+
+    Notes
+    -----
+    If the complete saliency map is zero, there is no informative maximum.
+    In that special case both modes fall back to a uniform distribution,
+    preserving the previous behaviour for empty event windows.
 
     Returns
     -------
     saliency_norm:
         HxW normalized activity map in [0, 1].
     fixation:
-        Tuple (x, y) sampled from the softmax probability map.
+        Tuple (x, y) selected by the requested policy.
     prob_map:
-        HxW probability map.
+        HxW selection map. For argmax this is a one-hot map whenever
+        saliency is non-zero.
     """
     saliency = np.asarray(saliency, dtype=np.float32)
 
     if saliency.ndim != 2:
         raise ValueError(f"Expected HxW saliency map. Got {saliency.shape}.")
+
+    mode = str(mode).lower()
+    if mode not in {"softmax", "argmax"}:
+        raise ValueError(
+            f"Unknown mode: {mode}. "
+            "Use 'softmax' or 'argmax'."
+        )
 
     if rng is None:
         rng = np.random.default_rng()
@@ -190,17 +228,38 @@ def _softmax_sample_from_saliency(
             1.0 / float(height * width),
             dtype=np.float32,
         )
+        flat_idx = int(rng.choice(prob_map.size, p=prob_map.reshape(-1)))
     else:
         saliency_norm = saliency / (smax + 1e-12)
-        logits = float(beta) * saliency_norm
-        logits = logits - float(logits.max())
-        exp_logits = np.exp(logits).astype(np.float32)
-        prob_map = exp_logits / (float(exp_logits.sum()) + 1e-12)
 
-    flat_idx = int(rng.choice(prob_map.size, p=prob_map.reshape(-1)))
-    peak_y, peak_x = np.unravel_index(flat_idx, prob_map.shape)
+        if mode == "softmax":
+            logits = float(beta) * saliency_norm
+            logits = logits - float(logits.max())
+            exp_logits = np.exp(logits).astype(np.float32)
+            prob_map = exp_logits / (float(exp_logits.sum()) + 1e-12)
+            flat_idx = int(rng.choice(prob_map.size, p=prob_map.reshape(-1)))
+        else:
+            flat_idx = int(np.argmax(saliency_norm.reshape(-1)))
+            prob_map = np.zeros((height, width), dtype=np.float32)
+            prob_map.reshape(-1)[flat_idx] = 1.0
+
+    peak_y, peak_x = np.unravel_index(flat_idx, (height, width))
 
     return saliency_norm.astype(np.float32), (int(peak_x), int(peak_y)), prob_map
+
+
+def _softmax_sample_from_saliency(
+    saliency: np.ndarray,
+    beta: float = 10.0,
+    rng: np.random.Generator | None = None,
+) -> tuple[np.ndarray, tuple[int, int], np.ndarray]:
+    """Backward-compatible wrapper for the original softmax-only helper."""
+    return _select_fixation_from_saliency(
+        saliency=saliency,
+        mode="softmax",
+        beta=beta,
+        rng=rng,
+    )
 
 
 def _zero_2pi_tan(x: float, y: float) -> float:
@@ -373,13 +432,14 @@ def compute_lif_vm_saliency_map(
     net,
     device,
     num_pyr: int = 6,
+    mode: str = "softmax",
     beta: float = 10.0,
     rng: np.random.Generator | None = None,
     reset_state: bool = False,
 ) -> tuple[np.ndarray, tuple[int, int], np.ndarray]:
     """
     Compute a saliency map using Von Mises orientation filters followed by
-    Sinabs LIF neurons, then sample a fixation from softmax(beta * saliency).
+    Sinabs LIF neurons, then select a fixation using softmax or argmax.
 
     This backend makes the saliency map an explicit spiking population
     activity map rather than a purely image-filtered centre-surround map.
@@ -429,7 +489,12 @@ def compute_lif_vm_saliency_map(
 
             saliency += y_sum[0, 0].detach().cpu().numpy().astype(np.float32)
 
-    return _softmax_sample_from_saliency(saliency, beta=beta, rng=rng)
+    return _select_fixation_from_saliency(
+        saliency,
+        mode=mode,
+        beta=beta,
+        rng=rng,
+    )
 
 
 def compute_saliency_map(
@@ -437,16 +502,18 @@ def compute_saliency_map(
     center_sigma: float = 2.0,
     surround_sigma: float = 8.0,
     num_pyr: int = 6,
+    mode: str = "softmax",
     beta: float = 10.0,
     rng: np.random.Generator | None = None,
 ) -> tuple[np.ndarray, tuple[int, int], np.ndarray]:
     """
-    Compute saliency map and sample fixation from softmax.
+    Compute centre-surround saliency and select a fixation.
 
-    The selected fixation is always sampled from:
+    ``mode='softmax'`` samples from
+    ``softmax(beta * saliency_norm)``.
 
-        prob_map = softmax(beta * saliency_norm)
-
+    ``mode='argmax'`` deterministically selects the maximum and
+    ignores ``beta``.
     """
     frame = np.asarray(event_frame, dtype=np.float32)
 
@@ -470,40 +537,14 @@ def compute_saliency_map(
 
         diff = center - surround
         diff[diff < 0] = 0.0
-
         saliency += diff
 
-    if rng is None:
-        rng = np.random.default_rng()
-
-    smax = float(saliency.max())
-
-    if smax <= 0:
-        saliency_norm = np.zeros_like(saliency, dtype=np.float32)
-
-        prob_map = np.full(
-            (height, width),
-            1.0 / float(height * width),
-            dtype=np.float32,
-        )
-
-        flat_idx = int(rng.choice(prob_map.size, p=prob_map.reshape(-1)))
-        peak_y, peak_x = np.unravel_index(flat_idx, prob_map.shape)
-
-        return saliency_norm, (int(peak_x), int(peak_y)), prob_map
-
-    saliency_norm = saliency / (smax + 1e-12)
-
-    logits = float(beta) * saliency_norm
-    logits = logits - float(logits.max())
-
-    exp_logits = np.exp(logits).astype(np.float32)
-    prob_map = exp_logits / (float(exp_logits.sum()) + 1e-12)
-
-    flat_idx = int(rng.choice(prob_map.size, p=prob_map.reshape(-1)))
-    peak_y, peak_x = np.unravel_index(flat_idx, prob_map.shape)
-
-    return saliency_norm.astype(np.float32), (int(peak_x), int(peak_y)), prob_map
+    return _select_fixation_from_saliency(
+        saliency,
+        mode=mode,
+        beta=beta,
+        rng=rng,
+    )
 
 
 def _normalise_to_uint8(x: np.ndarray) -> np.ndarray:
@@ -674,9 +715,9 @@ def run_attention(
         events.npy
             -> temporal event windows
             -> accumulated event window
-            -> multiscale center-surround saliency
-            -> softmax(beta * saliency)
-            -> sample saliency/fixation point
+            -> saliency map
+            -> fixation-selection policy (softmax or argmax)
+            -> selected saliency/fixation point
             -> black Gaussian foveation centered on sampled saliency point
             -> save fov/roi_00000.png, fov/roi_00001.png, ...
             -> save saccades.dat
@@ -745,6 +786,21 @@ def run_attention(
         sigma = max(1.0, 0.10 * float(min(height, width)))
 
     saliency_backend = str(merged_params.get("saliency_backend", "center_surround")).lower()
+    mode = str(merged_params.get("mode", "softmax")).lower()
+
+    if mode not in {"softmax", "argmax"}:
+        raise ValueError(
+            f"Unknown mode: {mode}. "
+            "Use 'softmax' or 'argmax'."
+        )
+
+    if mode == "softmax":
+        print(
+            f"[attention] Fixation policy: softmax "
+            f"(beta={float(merged_params.get('beta', 10.0)):g})."
+        )
+    else:
+        print("[attention] Fixation policy: argmax (beta ignored).")
 
     lif_net = None
     lif_device = None
@@ -774,6 +830,7 @@ def run_attention(
                 net=lif_net,
                 device=lif_device,
                 num_pyr=merged_params.get("num_pyr", 6),
+                mode=mode,
                 beta=merged_params.get("beta", 10.0),
                 rng=rng,
                 reset_state=not bool(merged_params.get("lif_stateful", True)),
@@ -784,6 +841,7 @@ def run_attention(
                 center_sigma=merged_params.get("center_sigma", 2.0),
                 surround_sigma=merged_params.get("surround_sigma", 8.0),
                 num_pyr=merged_params.get("num_pyr", 6),
+                mode=mode,
                 beta=merged_params.get("beta", 10.0),
                 rng=rng,
             )
@@ -890,416 +948,12 @@ def run_attention(
         "num_foveations": int(len(fov_paths)),
         "resolution": (int(height), int(width)),
         "sigma": float(sigma),
-        "beta": float(merged_params.get("beta", 10.0)),
+        "mode": mode,
+        "beta": (
+            float(merged_params.get("beta", 10.0))
+            if mode == "softmax"
+            else None
+        ),
         "window_period_ms": float(window_period_ms),
         "fov_paths": fov_paths,
-    }
-
-
-def plot_attention_exploration(
-    events_npy: str | Path,
-    saccades_path: str | Path,
-    output_dir: str | Path,
-    resolution: tuple[int, int] | None = None,
-    beta: float | None = None,
-    object_label: str | None = None,
-
-    # Grid/object mask parameters.
-    per: float = 0.1,
-    noise_thresh: int = 100,
-
-    # Fixation handling.
-    exclude_initial_fixation: bool = True,
-    plot_trajectory: bool = True,
-
-    # Figure output.
-    save_name: str = "attention_exploration",
-    save_png: bool = True,
-    save_pdf: bool = True,
-    show: bool = True,
-) -> dict:
-    """
-    Plot explored object area from sampled attention fixations.
-
-    - creates:
-        left: global event map + object grid + saccades
-        right: fixation heatmap over object cells
-
-    - computes:
-        area_explored_coeff = visited object cells / total object cells
-
-    """
-    import matplotlib.pyplot as plt
-    import matplotlib.lines as mlines
-    import matplotlib.patches as mpatches
-
-    events_npy = Path(events_npy)
-    saccades_path = Path(saccades_path)
-    output_dir = Path(output_dir)
-
-    output_dir.mkdir(parents=True, exist_ok=True)
-
-    if not events_npy.exists():
-        raise FileNotFoundError(f"Events npy not found: {events_npy}")
-
-    if not saccades_path.exists():
-        raise FileNotFoundError(f"saccades.dat not found: {saccades_path}")
-
-    if object_label is None:
-        object_label = events_npy.stem
-
-    # ============================================================
-    # Load events
-    # ============================================================
-
-    data = np.load(events_npy)
-
-    if data.ndim != 2 or data.shape[1] < 4:
-        raise ValueError(f"Expected events with shape (N, 4), got {data.shape}")
-
-    x = data[:, 0].astype(np.int64)
-    y = data[:, 1].astype(np.int64)
-
-    if resolution is None:
-        W = int(x.max()) + 1
-        H = int(y.max()) + 1
-    else:
-        H, W = int(resolution[0]), int(resolution[1])
-
-    valid_events = (x >= 0) & (x < W) & (y >= 0) & (y < H)
-
-    x = x[valid_events]
-    y = y[valid_events]
-
-    if x.size == 0:
-        raise RuntimeError("No valid events after resolution filtering.")
-
-    # ============================================================
-    # Global event-density image
-    # ============================================================
-
-    counts = np.zeros((H, W), dtype=np.int32)
-    np.add.at(counts, (y, x), 1)
-
-    event_binary = counts > 0
-
-    # ============================================================
-    # Load sampled fixations from saccades.dat
-    # ============================================================
-
-    saccades = np.loadtxt(
-        saccades_path,
-        skiprows=1,
-        dtype=np.float64,
-    )
-
-    if saccades.ndim == 1:
-        saccades = saccades[None, :]
-
-    # saccades.dat columns:
-    attention_xy = saccades[:, [4, 5]].astype(np.float32)
-
-    if attention_xy.ndim != 2 or attention_xy.shape[1] != 2:
-        raise ValueError(
-            f"Expected attention_xy with shape (N, 2), got {attention_xy.shape}"
-        )
-
-    if exclude_initial_fixation and attention_xy.shape[0] > 1:
-        attention_xy_eff = attention_xy[1:]
-    else:
-        attention_xy_eff = attention_xy
-
-    if attention_xy_eff.shape[0] == 0:
-        raise RuntimeError("No effective fixations available after filtering.")
-
-    # ============================================================
-    # Define object grid
-    # ============================================================
-
-    crop_x = max(1, int(W * float(per)))
-    crop_y = max(1, int(H * float(per)))
-
-    n_cols = int(np.ceil(W / crop_x))
-    n_rows = int(np.ceil(H / crop_y))
-
-    object_mask = np.zeros((n_rows, n_cols), dtype=bool)
-
-    for i in range(n_rows):
-        for j in range(n_cols):
-            y0 = i * crop_y
-            x0 = j * crop_x
-
-            y1 = min(y0 + crop_y, H)
-            x1 = min(x0 + crop_x, W)
-
-            cell_count = counts[y0:y1, x0:x1].sum()
-
-            if cell_count >= int(noise_thresh):
-                object_mask[i, j] = True
-
-    # ============================================================
-    # Count fixations per object cell
-    # ============================================================
-
-    fix_counts = np.zeros((n_rows, n_cols), dtype=np.int32)
-
-    xs = np.clip(attention_xy_eff[:, 0].astype(np.int64), 0, W - 1)
-    ys = np.clip(attention_xy_eff[:, 1].astype(np.int64), 0, H - 1)
-
-    js = np.minimum(xs // crop_x, n_cols - 1)
-    is_ = np.minimum(ys // crop_y, n_rows - 1)
-
-    for i_cell, j_cell in zip(is_, js):
-        fix_counts[i_cell, j_cell] += 1
-
-    heatmap = fix_counts.astype(np.float32)
-    heatmap[~object_mask] = np.nan
-
-    total_obj_cells = int(object_mask.sum())
-    visited_obj_cells = int(np.nansum((heatmap > 0).astype(np.int32)))
-
-    if total_obj_cells > 0:
-        area_explored_coeff = visited_obj_cells / total_obj_cells
-    else:
-        area_explored_coeff = np.nan
-
-    print(
-        f"[Exploration | beta={beta}] "
-        f"Object cells: {total_obj_cells} | "
-        f"Visited: {visited_obj_cells} | "
-        f"Area explored coeff: {area_explored_coeff:.3f}"
-    )
-
-    # ============================================================
-    # Plot
-    # ============================================================
-
-    fig, (ax1, ax2) = plt.subplots(
-        1,
-        2,
-        figsize=(16, 8),
-        constrained_layout=True,
-    )
-
-    # ------------------------------------------------------------
-    # Left: event map + object grid + saccades
-    # ------------------------------------------------------------
-
-    ax1.imshow(
-        event_binary,
-        cmap="gray",
-        origin="upper",
-        vmin=0,
-        vmax=1,
-    )
-
-    ax1.set_aspect("equal")
-    ax1.set_xlabel(f"x ({W} px)", fontsize=14)
-    ax1.set_ylabel(f"y ({H} px)", fontsize=14)
-    ax1.set_xlim(0, W)
-    ax1.set_ylim(H, 0)
-
-    ax1.tick_params(
-        length=4,
-        width=1.2,
-        labelsize=10,
-        direction="in",
-    )
-
-    for i in range(n_rows):
-        for j in range(n_cols):
-            y0 = i * crop_y
-            x0 = j * crop_x
-
-            y1 = min(y0 + crop_y, H)
-            x1 = min(x0 + crop_x, W)
-
-            if object_mask[i, j]:
-                rect = plt.Rectangle(
-                    (x0, y0),
-                    x1 - x0,
-                    y1 - y0,
-                    facecolor="limegreen",
-                    alpha=0.25,
-                    edgecolor="black",
-                    linewidth=0.6,
-                )
-            else:
-                rect = plt.Rectangle(
-                    (x0, y0),
-                    x1 - x0,
-                    y1 - y0,
-                    facecolor="none",
-                    edgecolor="black",
-                    linewidth=0.3,
-                )
-
-            ax1.add_patch(rect)
-
-    if plot_trajectory and attention_xy.shape[0] >= 2:
-        ax1.plot(
-            attention_xy[:, 0],
-            attention_xy[:, 1],
-            "-",
-            color="royalblue",
-            linewidth=2.0,
-            alpha=0.5,
-            zorder=5,
-        )
-
-    ax1.scatter(
-        attention_xy_eff[:, 0],
-        attention_xy_eff[:, 1],
-        s=40,
-        color="royalblue",
-        edgecolors="white",
-        linewidth=0.6,
-        zorder=6,
-    )
-
-    if attention_xy.shape[0] >= 1:
-        ax1.scatter(
-            [attention_xy[0, 0]],
-            [attention_xy[0, 1]],
-            s=30,
-            facecolors="white",
-            edgecolors="royalblue",
-            linewidth=1.5,
-            zorder=7,
-        )
-
-    fix_patch = mlines.Line2D(
-        [],
-        [],
-        color="royalblue",
-        marker="o",
-        linestyle="None",
-        markersize=6,
-        label="Fixations",
-    )
-
-    sac_line = mlines.Line2D(
-        [],
-        [],
-        color="royalblue",
-        linestyle="-",
-        linewidth=2,
-        alpha=0.5,
-        label="Saccades",
-    )
-
-    obj_patch = mpatches.Patch(
-        facecolor="limegreen",
-        alpha=0.25,
-        edgecolor="limegreen",
-        label="Object cells",
-    )
-
-    ax1.legend(
-        handles=[fix_patch, sac_line, obj_patch],
-        loc="lower center",
-        bbox_to_anchor=(0.5, 1.01),
-        ncol=3,
-        frameon=True,
-        framealpha=0.9,
-        facecolor="none",
-        edgecolor="none",
-        fontsize=14,
-        columnspacing=1.0,
-        handletextpad=0.6,
-    )
-
-    # ------------------------------------------------------------
-    # Right: fixation heatmap over object cells
-    # ------------------------------------------------------------
-
-    cmap = plt.cm.get_cmap("viridis").copy()
-    cmap.set_bad(alpha=0.0)
-
-    extent = [0, W, H, 0]
-
-    im2 = ax2.imshow(
-        heatmap,
-        cmap=cmap,
-        origin="upper",
-        extent=extent,
-        interpolation="nearest",
-        aspect="equal",
-    )
-
-    cb = plt.colorbar(
-        im2,
-        ax=ax2,
-        fraction=0.033,
-        pad=0.01,
-    )
-
-    cb.set_label(
-        "Number of fixations per object cell",
-        fontsize=14,
-    )
-
-    for i in range(n_rows):
-        for j in range(n_cols):
-            if object_mask[i, j]:
-                x0 = j * crop_x
-                y0 = i * crop_y
-
-                x1 = min(x0 + crop_x, W)
-                y1 = min(y0 + crop_y, H)
-
-                ax2.add_patch(
-                    plt.Rectangle(
-                        (x0, y0),
-                        x1 - x0,
-                        y1 - y0,
-                        fill=False,
-                        edgecolor="white",
-                        linewidth=0.4,
-                        alpha=0.6,
-                    )
-                )
-
-    ax2.set_xlabel(f"x ({W} px)", fontsize=14)
-    ax2.set_ylabel(f"y ({H} px)", fontsize=14)
-    ax2.set_xlim(0, W)
-    ax2.set_ylim(H, 0)
-
-    ax2.set_title(
-        f"Explored object area = {area_explored_coeff:.3f}",
-        fontsize=16,
-        pad=22,
-    )
-
-    fig.suptitle(
-        f"{object_label} | beta={beta}",
-        fontsize=18,
-        y=1.04,
-    )
-
-    png_path = None
-    pdf_path = None
-
-    if save_png:
-        png_path = output_dir / f"{save_name}.png"
-        plt.savefig(png_path, dpi=300, bbox_inches="tight")
-
-    if save_pdf:
-        pdf_path = output_dir / f"{save_name}.pdf"
-        plt.savefig(pdf_path, dpi=300, bbox_inches="tight")
-
-    if show:
-        plt.show()
-    else:
-        plt.close(fig)
-
-    return {
-        "attention_exploration_png_path": str(png_path) if png_path else None,
-        "attention_exploration_pdf_path": str(pdf_path) if pdf_path else None,
-        "area_explored_coeff": float(area_explored_coeff),
-        "total_obj_cells": int(total_obj_cells),
-        "visited_obj_cells": int(visited_obj_cells),
-        "crop_x": int(crop_x),
-        "crop_y": int(crop_y),
-        "noise_thresh": int(noise_thresh),
     }
