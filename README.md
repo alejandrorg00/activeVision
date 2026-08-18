@@ -42,19 +42,19 @@ The tutorial follows five steps.
 
    Events are accumulated over short temporal windows. Each event frame is processed with a multiscale centre-surround saliency operator. The resulting saliency map is converted into a probability distribution using a temperature-weighted (neuromodulated) softmax:
 
-   $$
+```math
    p(x,y) = \frac{\exp(\beta S(x,y))}{\sum_{x',y'} \exp(\beta S(x',y'))}
-   $$
+```
 
-   where $S(x,y)$ is the normalised saliency map and $\beta$ is an inverse-temperature parameter. Larger $\beta$ values produce sharper, more deterministic attentional selections. Smaller $\beta$ values produce more exploratory sampling.
+   where $`S(x,y)`$ is the normalised saliency map and $`\beta`$ is an inverse-temperature parameter. Larger $`\beta`$ values produce sharper, more deterministic attentional selections. Smaller $`\beta`$ values produce more exploratory sampling.
 
 5. **Extract ROIs and saccadic displacements**
 
    The sampled attentional locations define regions of interest. Consecutive attention shifts define a saccadic trajectory:
 
-   $$
+```math
    s_t = (\Delta x_t, \Delta y_t)
-   $$
+```
 
    These trajectories provide a compact sensorimotor description of how the system explores the object.
 
@@ -66,11 +66,16 @@ The tutorial follows five steps.
 
 ```text
 activeVision/
-├── activeVision_tutorial.ipynb
+├── nb_activeVision_tutorial.ipynb
+├── nb_attention_neuromodulation_tutorial.ipynb
 ├── data/
 │   ├── airplane_010.blend
+│   ├── foveations.gif
+│   ├── saliency_window_action.gif
 │   └── renders/
+├── figures/
 ├── src/
+│   ├── analysis_helpers.py
 │   ├── scene/
 │   │   ├── blender_scene.py
 │   │   ├── camera_motion.py
@@ -98,3 +103,9 @@ Pillow
 If you use this tutorial, please cite the associated workshop abstract: 
 
 **Rodriguez-Garcia, A.**, Ghosh, A., Ramaswamy, S., & D'Angelo, G. (2025). *Object perception through visual attention*. Zenodo. https://doi.org/10.5281/zenodo.15802809
+
+
+
+<small>
+Object assets are sourced from <b>Toys4K</b> (Stojanov, Thai, & Rehg, 2021), whose assets are distributed under different Creative Commons licenses. Users should consult the original dataset resources for asset-specific attribution and licensing requirements: https://rehg.org/publication/dataset2/
+</small>
