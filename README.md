@@ -11,11 +11,11 @@ The pipeline is motivated by active vision and sensorimotor contingency theory. 
     <tr>
       <td align="center">
         <b>Neuormodulated proto-object attention</b><br>
-        <img src="data/renders/airplane_demo/motion_sequence/out/saliency_window_action.gif" height="240">
+        <img src="data/saliency_window_action.gif" height="240">
       </td>
       <td align="center">
         <b>Foveated views</b><br>
-        <img src="data/renders/airplane_demo/motion_sequence/out/foveations.gif" height="240">
+        <img src="data/foveations.gif" height="240">
       </td>
     </tr>
   </table>

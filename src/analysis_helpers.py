@@ -1857,366 +1857,6 @@ def _p_to_stars(p):
     return "ns"
 
 
-def _save_comparison_figure(
-    fig,
-    save_name,
-    figures_dir=None,
-    dpi=600,
-    save_png=True,
-    save_pdf=True,
-    save_svg=True,
-):
-    if figures_dir is None:
-        figures_dir = _default_figures_dir()
-    else:
-        figures_dir = Path(figures_dir)
-        figures_dir.mkdir(
-            parents=True,
-            exist_ok=True,
-        )
-
-    png_path = None
-    pdf_path = None
-    svg_path = None
-
-    if save_png:
-        png_path = (
-            figures_dir
-            / f"{save_name}.png"
-        )
-
-        fig.savefig(
-            png_path,
-            dpi=dpi,
-            bbox_inches="tight",
-            pad_inches=0.03,
-        )
-
-    if save_pdf:
-        pdf_path = (
-            figures_dir
-            / f"{save_name}.pdf"
-        )
-
-        fig.savefig(
-            pdf_path,
-            bbox_inches="tight",
-            pad_inches=0.03,
-        )
-
-    if save_svg:
-        svg_path = (
-            figures_dir
-            / f"{save_name}.svg"
-        )
-
-        fig.savefig(
-            svg_path,
-            bbox_inches="tight",
-            pad_inches=0.03,
-        )
-
-    return {
-        "png_path": (
-            str(png_path)
-            if png_path
-            else None
-        ),
-        "pdf_path": (
-            str(pdf_path)
-            if pdf_path
-            else None
-        ),
-        "svg_path": (
-            str(svg_path)
-            if svg_path
-            else None
-        ),
-    }
-
-
-def plot_softmax_argmax_by_object(
-    softmax_argmax_df,
-    softmax_argmax_object_df=None,
-    objects_order=None,
-    figures_dir=None,
-    figsize=(12.0, 4.3),
-    dpi=600,
-    save_png=True,
-    save_pdf=True,
-    save_svg=True,
-    show=True,
-):
-    """
-    Per-object Softmax vs Argmax comparison.
-
-    Bars:
-        object-level means.
-
-    Points:
-        individual seed-level runs.
-
-    Panels:
-        a) explored object area
-        b) normalized fixation entropy
-    """
-    import matplotlib.pyplot as plt
-
-    if objects_order is None:
-        objects_order = list(
-            dict.fromkeys(
-                softmax_argmax_df[
-                    "object"
-                ].tolist()
-            )
-        )
-
-    # If object means were not supplied, compute them here.
-    if softmax_argmax_object_df is None:
-        softmax_argmax_object_df = (
-            softmax_argmax_df
-            .groupby(
-                [
-                    "object",
-                    "mode",
-                ],
-                as_index=False,
-            )
-            .agg(
-                area_explored_coeff=(
-                    "area_explored_coeff",
-                    "mean",
-                ),
-                fixation_entropy_norm=(
-                    "fixation_entropy_norm",
-                    "mean",
-                ),
-            )
-        )
-
-    fig, axes = plt.subplots(
-        1,
-        2,
-        figsize=figsize,
-    )
-
-    fig.subplots_adjust(
-        left=0.075,
-        right=0.99,
-        bottom=0.25,
-        top=0.94,
-        wspace=0.30,
-    )
-
-    width = 0.34
-
-    condition_specs = [
-        (
-            "softmax",
-            -width / 2,
-            "navy",
-            "Softmax",
-        ),
-        (
-            "argmax",
-            width / 2,
-            "crimson",
-            "Argmax",
-        ),
-    ]
-
-    panel_specs = [
-        (
-            axes[0],
-            "area_explored_coeff",
-            "Explored object area",
-            "a",
-        ),
-        (
-            axes[1],
-            "fixation_entropy_norm",
-            "Normalised fixation entropy",
-            "b",
-        ),
-    ]
-
-    for (
-        ax,
-        metric,
-        ylabel,
-        panel_letter,
-    ) in panel_specs:
-
-        for (
-            mode,
-            dx,
-            color,
-            legend_label,
-        ) in condition_specs:
-
-            sub = (
-                softmax_argmax_object_df[
-                    softmax_argmax_object_df[
-                        "mode"
-                    ] == mode
-                ]
-                .set_index("object")
-                .reindex(objects_order)
-            )
-
-            xs = (
-                np.arange(
-                    len(objects_order),
-                    dtype=float,
-                )
-                + dx
-            )
-
-            ax.bar(
-                xs,
-                sub[metric].to_numpy(),
-                width=width,
-                color=color,
-                alpha=0.92,
-                label=legend_label,
-                zorder=1,
-            )
-
-            # Seed-level points
-            for i, obj in enumerate(
-                objects_order
-            ):
-                vals = (
-                    softmax_argmax_df[
-                        (
-                            softmax_argmax_df[
-                                "object"
-                            ] == obj
-                        )
-                        & (
-                            softmax_argmax_df[
-                                "mode"
-                            ] == mode
-                        )
-                    ][metric]
-                    .dropna()
-                    .to_numpy()
-                )
-
-                if len(vals) == 0:
-                    continue
-
-                if len(vals) == 1:
-                    jitter = np.array([0.0])
-                else:
-                    jitter = np.linspace(
-                        -0.035,
-                        0.035,
-                        len(vals),
-                    )
-
-                ax.scatter(
-                    np.full(
-                        len(vals),
-                        xs[i],
-                    )
-                    + jitter,
-                    vals,
-                    s=34,
-                    facecolors="white",
-                    edgecolors=color,
-                    linewidths=1.4,
-                    zorder=4,
-                )
-
-        ax.set_ylabel(
-            ylabel,
-            fontsize=12,
-        )
-
-        ax.set_xticks(
-            np.arange(
-                len(objects_order)
-            )
-        )
-
-        ax.set_xticklabels(
-            objects_order,
-            rotation=40,
-            ha="right",
-            fontsize=10,
-        )
-
-        ax.tick_params(
-            axis="y",
-            direction="out",
-            length=4,
-            width=1.0,
-            labelsize=10,
-        )
-
-        ax.tick_params(
-            axis="x",
-            length=0,
-            width=0,
-            pad=5,
-        )
-
-        ax.spines[
-            "top"
-        ].set_visible(False)
-
-        ax.spines[
-            "right"
-        ].set_visible(False)
-
-        ax.spines[
-            "bottom"
-        ].set_visible(False)
-
-        ax.spines[
-            "left"
-        ].set_linewidth(1.0)
-
-        ax.grid(False)
-
-        # No panel title.
-        ax.text(
-            -0.12,
-            1.02,
-            panel_letter,
-            transform=ax.transAxes,
-            fontsize=14,
-            fontweight="bold",
-            va="bottom",
-        )
-
-    axes[0].legend(
-        frameon=False,
-        fontsize=10,
-        loc="upper left",
-    )
-
-    paths = _save_comparison_figure(
-        fig=fig,
-        save_name=(
-            "softmax_argmax_by_object"
-        ),
-        figures_dir=figures_dir,
-        dpi=dpi,
-        save_png=save_png,
-        save_pdf=save_pdf,
-        save_svg=save_svg,
-    )
-
-    if show:
-        plt.show()
-    else:
-        plt.close(fig)
-
-    return paths
-
-
 def _add_star_bracket(
     ax,
     x1,
@@ -2543,7 +2183,7 @@ def _paired_comparison_panel(
     ax.grid(False)
 
     ax.text(
-        -0.15,
+        -0.25,
         1.02,
         panel_letter,
         transform=ax.transAxes,
@@ -2553,12 +2193,93 @@ def _paired_comparison_panel(
         va="top",
     )
 
-def plot_softmax_argmax_paired(
-    softmax_argmax_object_df,
+
+
+
+def _save_comparison_figure(
+    fig,
+    save_name,
+    figures_dir=None,
+    dpi=600,
+    save_png=True,
+    save_pdf=True,
+    save_svg=True,
+):
+    if figures_dir is None:
+        figures_dir = _default_figures_dir()
+    else:
+        figures_dir = Path(figures_dir)
+        figures_dir.mkdir(
+            parents=True,
+            exist_ok=True,
+        )
+
+    png_path = None
+    pdf_path = None
+    svg_path = None
+
+    if save_png:
+        png_path = (
+            figures_dir
+            / f"{save_name}.png"
+        )
+
+        fig.savefig(
+            png_path,
+            dpi=dpi,
+            bbox_inches="tight",
+            pad_inches=0.03,
+        )
+
+    if save_pdf:
+        pdf_path = (
+            figures_dir
+            / f"{save_name}.pdf"
+        )
+
+        fig.savefig(
+            pdf_path,
+            bbox_inches="tight",
+            pad_inches=0.03,
+        )
+
+    if save_svg:
+        svg_path = (
+            figures_dir
+            / f"{save_name}.svg"
+        )
+
+        fig.savefig(
+            svg_path,
+            bbox_inches="tight",
+            pad_inches=0.03,
+        )
+
+    return {
+        "png_path": (
+            str(png_path)
+            if png_path
+            else None
+        ),
+        "pdf_path": (
+            str(pdf_path)
+            if pdf_path
+            else None
+        ),
+        "svg_path": (
+            str(svg_path)
+            if svg_path
+            else None
+        ),
+    }
+
+def plot_softmax_argmax_overview_1x4(
+    softmax_argmax_df,
+    softmax_argmax_object_df=None,
     objects_order=None,
     softmax_beta=0.5,
     figures_dir=None,
-    figsize=(7.8, 4.6),
+    figsize=(15.0, 4.6),
     dpi=600,
     save_png=True,
     save_pdf=True,
@@ -2566,41 +2287,170 @@ def plot_softmax_argmax_paired(
     show=True,
 ):
     """
-    Object-level paired comparison:
-        Softmax exploration vs Argmax exploitation.
+    Combined Softmax-vs-Argmax overview.
 
-    Exact p-values are printed.
-    Only significance stars are drawn on the figure.
+    Layout:
+        1) by-object explored object area
+        2) paired explored object area
+        3) by-object normalised fixation entropy
+        4) paired normalised fixation entropy
+
+    The paired panels use the same aesthetics as
+    plot_exploration_balance_exploitation_paired():
+        - light gray violin
+        - slategray paired trajectories
+        - thin transparent boxplot
+        - hollow condition-coloured object points
+        - significance bracket with stars
+
+    The by-object panels show:
+        - outlined condition bars
+        - black seed-level observations
     """
+    import numpy as np
     import matplotlib.pyplot as plt
 
+    # ============================================================
+    # Validation
+    # ============================================================
+    required_seed_columns = {
+        "object",
+        "mode",
+        "area_explored_coeff",
+        "fixation_entropy_norm",
+    }
+
+    missing = (
+        required_seed_columns
+        - set(softmax_argmax_df.columns)
+    )
+
+    if missing:
+        raise ValueError(
+            "softmax_argmax_df is missing columns: "
+            + ", ".join(sorted(missing))
+        )
+
+    # ============================================================
+    # Object order
+    # ============================================================
     if objects_order is None:
         objects_order = list(
             dict.fromkeys(
-                softmax_argmax_object_df[
+                softmax_argmax_df[
                     "object"
                 ].tolist()
             )
         )
 
+    # ============================================================
+    # Seed-level dataframe
+    # ============================================================
+    seed_df = (
+        softmax_argmax_df
+        .copy()
+    )
+
+    seed_df["mode"] = (
+        seed_df["mode"]
+        .astype(str)
+        .str.lower()
+    )
+
+    # ------------------------------------------------------------
+    # Softmax seeds
+    # ------------------------------------------------------------
+    if "beta" in seed_df.columns:
+
+        softmax_seed_df = seed_df[
+            (
+                seed_df["mode"]
+                == "softmax"
+            )
+            & np.isclose(
+                seed_df["beta"].astype(float),
+                float(softmax_beta),
+            )
+        ].copy()
+
+    else:
+
+        softmax_seed_df = seed_df[
+            seed_df["mode"]
+            == "softmax"
+        ].copy()
+
+    # ------------------------------------------------------------
+    # Argmax
+    # ------------------------------------------------------------
+    argmax_seed_df = seed_df[
+        seed_df["mode"]
+        == "argmax"
+    ].copy()
+
+    # ============================================================
+    # Object-level means
+    # ============================================================
+    if softmax_argmax_object_df is None:
+
+        object_df = (
+            seed_df
+            .groupby(
+                [
+                    "object",
+                    "mode",
+                ],
+                as_index=False,
+            )
+            .agg(
+                area_explored_coeff=(
+                    "area_explored_coeff",
+                    "mean",
+                ),
+                fixation_entropy_norm=(
+                    "fixation_entropy_norm",
+                    "mean",
+                ),
+            )
+        )
+
+    else:
+
+        object_df = (
+            softmax_argmax_object_df
+            .copy()
+        )
+
+    object_df["mode"] = (
+        object_df["mode"]
+        .astype(str)
+        .str.lower()
+    )
+
+    softmax_object_df = object_df[
+        object_df["mode"]
+        == "softmax"
+    ].copy()
+
+    argmax_object_df = object_df[
+        object_df["mode"]
+        == "argmax"
+    ].copy()
+
+    # ============================================================
+    # Extract paired object-level values
+    # ============================================================
     def get_paired_values(metric):
+
         softmax_map = (
-            softmax_argmax_object_df[
-                softmax_argmax_object_df[
-                    "mode"
-                ] == "softmax"
-            ]
+            softmax_object_df
             .set_index("object")[
                 metric
             ]
         )
 
         argmax_map = (
-            softmax_argmax_object_df[
-                softmax_argmax_object_df[
-                    "mode"
-                ] == "argmax"
-            ]
+            argmax_object_df
             .set_index("object")[
                 metric
             ]
@@ -2620,6 +2470,12 @@ def plot_softmax_argmax_paired(
                 )
             )
         ]
+
+        if len(valid_objects) == 0:
+            raise RuntimeError(
+                f"No paired objects available "
+                f"for {metric}."
+            )
 
         softmax = np.asarray(
             [
@@ -2643,6 +2499,9 @@ def plot_softmax_argmax_paired(
             argmax,
         )
 
+    # ------------------------------------------------------------
+    # Area
+    # ------------------------------------------------------------
     (
         objects_area,
         area_softmax,
@@ -2651,6 +2510,9 @@ def plot_softmax_argmax_paired(
         "area_explored_coeff"
     )
 
+    # ------------------------------------------------------------
+    # Entropy
+    # ------------------------------------------------------------
     (
         objects_entropy,
         entropy_softmax,
@@ -2665,6 +2527,9 @@ def plot_softmax_argmax_paired(
             "the same paired objects."
         )
 
+    # ============================================================
+    # Statistics
+    # ============================================================
     p_area = exact_sign_flip_test(
         area_softmax,
         area_argmax,
@@ -2675,7 +2540,6 @@ def plot_softmax_argmax_paired(
         entropy_argmax,
     )
 
-    # Exact p-values are printed, not plotted.
     print(
         "Softmax vs Argmax"
     )
@@ -2690,13 +2554,402 @@ def plot_softmax_argmax_paired(
         f"p = {p_entropy:.5f}"
     )
 
+    # ============================================================
+    # Colours
+    # ============================================================
+    COLOR_SOFTMAX = "navy"
+    COLOR_ARGMAX = "crimson"
+
+    colors = [
+        COLOR_SOFTMAX,
+        COLOR_ARGMAX,
+    ]
+
+    # ============================================================
+    # Figure
+    # ============================================================
     fig, axes = plt.subplots(
         1,
-        2,
+        4,
         figsize=figsize,
+        gridspec_kw={
+            "width_ratios": [
+                1.25,
+                0.72,
+                1.25,
+                0.72,
+            ],
+        },
     )
 
-    labels = [
+    fig.subplots_adjust(
+        left=0.055,
+        right=0.99,
+        bottom=0.25,
+        top=0.84,
+        wspace=0.38,
+    )
+
+    # ============================================================
+    # Shared style
+    # ============================================================
+    label_fs = 12
+    tick_fs = 10
+    panel_fs = 14
+    legend_fs = 12
+
+    bar_width = 0.34
+
+    # ============================================================
+    # By-object aesthetics
+    # ============================================================
+    def style_by_object_axis(ax):
+
+        ax.set_facecolor(
+            "white"
+        )
+
+        ax.grid(
+            False
+        )
+
+        ax.spines[
+            "top"
+        ].set_visible(
+            False
+        )
+
+        ax.spines[
+            "right"
+        ].set_visible(
+            False
+        )
+
+        # Same visual language as paired plots
+        ax.spines[
+            "bottom"
+        ].set_visible(
+            False
+        )
+
+        ax.spines[
+            "left"
+        ].set_visible(
+            True
+        )
+
+        ax.spines[
+            "left"
+        ].set_color(
+            "black"
+        )
+
+        ax.spines[
+            "left"
+        ].set_linewidth(
+            1.0
+        )
+
+        ax.tick_params(
+            axis="y",
+            colors="black",
+            width=1.0,
+            length=4,
+            direction="out",
+            labelsize=tick_fs,
+        )
+
+        ax.tick_params(
+            axis="x",
+            colors="black",
+            length=0,
+            width=0,
+            pad=8,
+            labelsize=tick_fs,
+        )
+
+    # ============================================================
+    # By-object plot helper
+    # ============================================================
+    def plot_by_object_panel(
+        ax,
+        metric,
+        ylabel,
+        panel_letter,
+    ):
+
+        x = np.arange(
+            len(objects_order),
+            dtype=float,
+        )
+
+        # --------------------------------------------------------
+        # Object-level means
+        # --------------------------------------------------------
+        softmax_map = (
+            softmax_object_df
+            .set_index("object")[
+                metric
+            ]
+        )
+
+        argmax_map = (
+            argmax_object_df
+            .set_index("object")[
+                metric
+            ]
+        )
+
+        softmax_means = np.asarray(
+            [
+                (
+                    softmax_map.loc[obj]
+                    if obj in softmax_map.index
+                    else np.nan
+                )
+                for obj in objects_order
+            ],
+            dtype=float,
+        )
+
+        argmax_means = np.asarray(
+            [
+                (
+                    argmax_map.loc[obj]
+                    if obj in argmax_map.index
+                    else np.nan
+                )
+                for obj in objects_order
+            ],
+            dtype=float,
+        )
+
+        # --------------------------------------------------------
+        # Outline bars
+        # --------------------------------------------------------
+        ax.bar(
+            x - bar_width / 2,
+            softmax_means,
+            width=bar_width,
+            facecolor="none",
+            edgecolor=COLOR_SOFTMAX,
+            linewidth=2.5,
+            zorder=1,
+        )
+
+        ax.bar(
+            x + bar_width / 2,
+            argmax_means,
+            width=bar_width,
+            facecolor="none",
+            edgecolor=COLOR_ARGMAX,
+            linewidth=2.5,
+            zorder=1,
+        )
+
+        # --------------------------------------------------------
+        # Seed-level observations
+        # --------------------------------------------------------
+        for i, obj in enumerate(
+            objects_order
+        ):
+
+            softmax_values = (
+                softmax_seed_df[
+                    softmax_seed_df[
+                        "object"
+                    ] == obj
+                ][metric]
+                .dropna()
+                .to_numpy(
+                    dtype=float
+                )
+            )
+
+            argmax_values = (
+                argmax_seed_df[
+                    argmax_seed_df[
+                        "object"
+                    ] == obj
+                ][metric]
+                .dropna()
+                .to_numpy(
+                    dtype=float
+                )
+            )
+
+            # Softmax seeds
+            if len(
+                softmax_values
+            ) > 0:
+
+                if len(
+                    softmax_values
+                ) == 1:
+
+                    jitter = np.array(
+                        [0.0]
+                    )
+
+                else:
+
+                    jitter = np.linspace(
+                        -0.04,
+                        0.04,
+                        len(
+                            softmax_values
+                        ),
+                    )
+
+                ax.scatter(
+                    (
+                        x[i]
+                        - bar_width / 2
+                        + jitter
+                    ),
+                    softmax_values,
+                    s=28,
+                    facecolor="black",
+                    edgecolor="white",
+                    linewidth=0.5,
+                    alpha=0.90,
+                    zorder=4,
+                )
+
+            # Argmax observation(s)
+            if len(
+                argmax_values
+            ) > 0:
+
+                if len(
+                    argmax_values
+                ) == 1:
+
+                    jitter = np.array(
+                        [0.0]
+                    )
+
+                else:
+
+                    jitter = np.linspace(
+                        -0.04,
+                        0.04,
+                        len(
+                            argmax_values
+                        ),
+                    )
+
+                ax.scatter(
+                    (
+                        x[i]
+                        + bar_width / 2
+                        + jitter
+                    ),
+                    argmax_values,
+                    s=28,
+                    facecolor="black",
+                    edgecolor="white",
+                    linewidth=0.5,
+                    alpha=0.90,
+                    zorder=4,
+                )
+
+        # --------------------------------------------------------
+        # Dynamic y-limits
+        # --------------------------------------------------------
+        all_values = []
+
+        for values in (
+            softmax_means,
+            argmax_means,
+        ):
+
+            valid = values[
+                np.isfinite(values)
+            ]
+
+            if len(valid) > 0:
+                all_values.extend(
+                    valid.tolist()
+                )
+
+        all_values = np.asarray(
+            all_values,
+            dtype=float,
+        )
+
+        y_min = float(
+            np.min(all_values)
+        )
+
+        y_max = float(
+            np.max(all_values)
+        )
+
+        yrange = max(
+            y_max - y_min,
+            1e-6,
+        )
+
+        ax.set_ylim(
+            max(
+                0.0,
+                y_min
+                - 0.08 * yrange,
+            ),
+            y_max
+            + 0.12 * yrange,
+        )
+
+        # --------------------------------------------------------
+        # Labels
+        # --------------------------------------------------------
+        ax.set_xlim(
+            -0.65,
+            len(objects_order)
+            - 0.35,
+        )
+
+        ax.set_xticks(
+            x
+        )
+
+        ax.set_xticklabels(
+            objects_order,
+            rotation=40,
+            ha="right",
+            fontsize=tick_fs,
+            color="black",
+        )
+
+        ax.set_ylabel(
+            ylabel,
+            fontsize=label_fs,
+            color="black",
+        )
+
+        style_by_object_axis(
+            ax
+        )
+
+        # --------------------------------------------------------
+        # Panel label
+        # --------------------------------------------------------
+        ax.text(
+            -0.22,
+            1.12,
+            panel_letter,
+            transform=ax.transAxes,
+            fontsize=panel_fs,
+            fontweight="bold",
+            color="black",
+            va="top",
+        )
+
+    # ============================================================
+    # Labels for paired plots
+    # ============================================================
+    paired_labels = [
         (
             "Softmax\n"
             "Exploration\n"
@@ -2708,18 +2961,27 @@ def plot_softmax_argmax_paired(
         ),
     ]
 
-    colors = [
-        "navy",
-        "crimson",
-    ]
+    # ============================================================
+    # a — explored object area
+    # ============================================================
+    plot_by_object_panel(
+        ax=axes[0],
+        metric=(
+            "area_explored_coeff"
+        ),
+        ylabel=(
+            "Explored object area"
+        ),
+        panel_letter="a",
+    )
 
     _paired_comparison_panel(
-        ax=axes[0],
+        ax=axes[1],
         data=[
             area_softmax,
             area_argmax,
         ],
-        labels=labels,
+        labels=paired_labels,
         colors=colors,
         ylabel=(
             "Explored object area"
@@ -2730,16 +2992,32 @@ def plot_softmax_argmax_paired(
         pvalues=[
             p_area,
         ],
-        panel_letter="a",
+        # no additional panel letter:
+        # axes[0] already represents panel a
+        panel_letter="",
+    )
+
+    # ============================================================
+    # b — normalised fixation entropy
+    # ============================================================
+    plot_by_object_panel(
+        ax=axes[2],
+        metric=(
+            "fixation_entropy_norm"
+        ),
+        ylabel=(
+            "Normalised fixation entropy"
+        ),
+        panel_letter="b",
     )
 
     _paired_comparison_panel(
-        ax=axes[1],
+        ax=axes[3],
         data=[
             entropy_softmax,
             entropy_argmax,
         ],
-        labels=labels,
+        labels=paired_labels,
         colors=colors,
         ylabel=(
             "Normalised fixation entropy"
@@ -2750,17 +3028,83 @@ def plot_softmax_argmax_paired(
         pvalues=[
             p_entropy,
         ],
-        panel_letter="b",
+        panel_letter="",
     )
 
-    fig.tight_layout(
-        w_pad=2.2,
+    # ============================================================
+    # One-row legend
+    # ============================================================
+    legend_handles = [
+        plt.Line2D(
+            [],
+            [],
+            marker="s",
+            linestyle="None",
+            markersize=9,
+            markerfacecolor="none",
+            markeredgecolor=(
+                COLOR_SOFTMAX
+            ),
+            markeredgewidth=2.0,
+            label=(
+                "Softmax Exploration "
+                + rf"($\beta={softmax_beta:g}$)"
+            ),
+        ),
+
+        plt.Line2D(
+            [],
+            [],
+            marker="s",
+            linestyle="None",
+            markersize=9,
+            markerfacecolor="none",
+            markeredgecolor=(
+                COLOR_ARGMAX
+            ),
+            markeredgewidth=2.0,
+            label=(
+                "Argmax Exploitation"
+            ),
+        ),
+
+        plt.Line2D(
+            [],
+            [],
+            marker="o",
+            linestyle="None",
+            markersize=5.5,
+            markerfacecolor="black",
+            markeredgecolor="white",
+            markeredgewidth=0.5,
+            label=(
+                "Individual run"
+            ),
+        ),
+    ]
+
+    fig.legend(
+        handles=legend_handles,
+        loc="upper center",
+        bbox_to_anchor=(
+            0.5,
+            0.995,
+        ),
+        ncol=3,
+        frameon=False,
+        fontsize=legend_fs,
+        handlelength=1.0,
+        handletextpad=1.0,
+        columnspacing=1.5,
     )
 
+    # ============================================================
+    # Save
+    # ============================================================
     paths = _save_comparison_figure(
         fig=fig,
         save_name=(
-            "softmax_argmax_paired"
+            "softmax_argmax_overview_1x4"
         ),
         figures_dir=figures_dir,
         dpi=dpi,
@@ -2781,15 +3125,11 @@ def plot_softmax_argmax_paired(
         "objects": objects_area,
     }
 
-
-def plot_exploration_balance_exploitation_paired(
+def plot_beta_sweep_by_object(
     beta_object_df,
-    softmax_argmax_object_df,
-    exploration_beta=0.5,
-    balance_beta=5.0,
     objects_order=None,
     figures_dir=None,
-    figsize=(8.8, 4.8),
+    figsize=(8.6, 3.8),
     dpi=600,
     save_png=True,
     save_pdf=True,
@@ -2797,23 +3137,497 @@ def plot_exploration_balance_exploitation_paired(
     show=True,
 ):
     """
-    Object-level paired comparison of:
+    Plot object-level trajectories across the Softmax beta sweep.
 
-        Softmax exploration
-        Softmax intermediate/balance
-        Argmax exploitation
+    Panels:
+        a) explored object area
+        b) normalised fixation entropy
 
-    Statistics:
+    Each coloured trajectory corresponds to one object.
+
+    A dashed black curve shows the overall second-order trend
+    across object-level observations, with a 95% confidence interval.
+
+    Beta is represented internally as log10(beta), while the
+    displayed x-axis ticks retain the original beta values.
+    """
+    import numpy as np
+    import matplotlib.pyplot as plt
+    import seaborn as sns
+
+    # ------------------------------------------------------------
+    # Validate required columns
+    # ------------------------------------------------------------
+    required_columns = {
+        "object",
+        "beta",
+        "area_explored_coeff",
+        "fixation_entropy_norm",
+    }
+
+    missing = (
+        required_columns
+        - set(beta_object_df.columns)
+    )
+
+    if missing:
+        raise ValueError(
+            "beta_object_df is missing required columns: "
+            + ", ".join(sorted(missing))
+        )
+
+    # ------------------------------------------------------------
+    # Prepare dataframe
+    # ------------------------------------------------------------
+    df = beta_object_df.copy()
+
+    df["beta"] = (
+        df["beta"]
+        .astype(float)
+    )
+
+    if (df["beta"] <= 0).any():
+        raise ValueError(
+            "All beta values must be > 0."
+        )
+
+    # Work in log10(beta), but display original beta values
+    df["log_beta"] = np.log10(
+        df["beta"]
+    )
+
+    # ------------------------------------------------------------
+    # Object order
+    # ------------------------------------------------------------
+    if objects_order is None:
+        objects_order = list(
+            dict.fromkeys(
+                df["object"].tolist()
+            )
+        )
+
+    # ------------------------------------------------------------
+    # Beta values
+    # ------------------------------------------------------------
+    betas = np.sort(
+        df["beta"].unique()
+    )
+
+    log_betas = np.log10(
+        betas
+    )
+
+    # ------------------------------------------------------------
+    # Colour palette
+    # ------------------------------------------------------------
+    palette_colors = sns.color_palette(
+        "flare",
+        n_colors=len(objects_order),
+    )
+
+    object_palette = {
+        obj: palette_colors[i]
+        for i, obj in enumerate(
+            objects_order
+        )
+    }
+
+    # ------------------------------------------------------------
+    # Figure
+    # ------------------------------------------------------------
+    fig, axes = plt.subplots(
+        1,
+        2,
+        figsize=figsize,
+    )
+
+    # Space for one-row legend
+    fig.subplots_adjust(
+        left=0.085,
+        right=0.985,
+        bottom=0.20,
+        top=0.80,
+        wspace=0.30,
+    )
+
+    panel_specs = [
+        (
+            axes[0],
+            "area_explored_coeff",
+            "Explored object area",
+            "a",
+        ),
+        (
+            axes[1],
+            "fixation_entropy_norm",
+            "Normalised fixation entropy",
+            "b",
+        ),
+    ]
+
+    # ------------------------------------------------------------
+    # Style parameters
+    # ------------------------------------------------------------
+    label_fs = 10
+    tick_fs = 9
+    legend_fs = 10
+    panel_fs = 13
+
+    # ============================================================
+    # Panels
+    # ============================================================
+    for (
+        ax,
+        metric,
+        ylabel,
+        panel_letter,
+    ) in panel_specs:
+
+        # --------------------------------------------------------
+        # Individual object trajectories
+        # --------------------------------------------------------
+        for obj in objects_order:
+
+            sub = (
+                df[
+                    df["object"] == obj
+                ]
+                .copy()
+                .sort_values("beta")
+            )
+
+            if len(sub) == 0:
+                continue
+
+            ax.plot(
+                sub["log_beta"],
+                sub[metric],
+                color=object_palette[obj],
+                linewidth=1.5,
+                alpha=0.50,
+                zorder=2,
+            )
+
+        # --------------------------------------------------------
+        # Object-level points
+        # --------------------------------------------------------
+        for obj in objects_order:
+
+            sub = (
+                df[
+                    df["object"] == obj
+                ]
+                .copy()
+                .sort_values("beta")
+            )
+
+            if len(sub) == 0:
+                continue
+
+            ax.scatter(
+                sub["log_beta"],
+                sub[metric],
+                s=28,
+                color=object_palette[obj],
+                edgecolor="white",
+                linewidth=0.55,
+                alpha=0.90,
+                zorder=3,
+            )
+
+        # --------------------------------------------------------
+        # Overall trend + 95% CI
+        # --------------------------------------------------------
+        sns.regplot(
+            data=df,
+            x="log_beta",
+            y=metric,
+            scatter=False,
+            order=2,
+            truncate=False,
+            ci=95,
+            n_boot=1000,
+            seed=0,
+            color="0.20",
+            line_kws={
+                "linewidth": 1.8,
+                "alpha": 0.90,
+                "linestyle": "--",
+                "zorder": 4,
+            },
+            ax=ax,
+        )
+
+        # --------------------------------------------------------
+        # X-axis
+        # --------------------------------------------------------
+        ax.set_xticks(
+            log_betas
+        )
+
+        ax.set_xticklabels(
+            [
+                f"{beta:g}"
+                for beta in betas
+            ]
+        )
+
+        ax.set_xlabel(
+            r"Attentional gain $\beta$",
+            fontsize=label_fs,
+            labelpad=5,
+        )
+
+        ax.set_ylabel(
+            ylabel,
+            fontsize=label_fs,
+            labelpad=5,
+        )
+
+        # --------------------------------------------------------
+        # Dynamic Y limits
+        # --------------------------------------------------------
+        y_values = (
+            df[metric]
+            .astype(float)
+            .to_numpy()
+        )
+
+        y_min = float(
+            np.nanmin(y_values)
+        )
+
+        y_max = float(
+            np.nanmax(y_values)
+        )
+
+        y_range = max(
+            y_max - y_min,
+            1e-6,
+        )
+
+        ax.set_ylim(
+            max(
+                0.0,
+                y_min - 0.05 * y_range,
+            ),
+            y_max + 0.08 * y_range,
+        )
+
+        # --------------------------------------------------------
+        # Clean paper-style axes
+        # --------------------------------------------------------
+        ax.set_facecolor(
+            "white"
+        )
+
+        ax.grid(
+            False
+        )
+
+        ax.spines[
+            "top"
+        ].set_visible(
+            False
+        )
+
+        ax.spines[
+            "right"
+        ].set_visible(
+            False
+        )
+
+        ax.spines[
+            "left"
+        ].set_position(
+            ("outward", 5)
+        )
+
+        ax.spines[
+            "bottom"
+        ].set_position(
+            ("outward", 5)
+        )
+
+        ax.spines[
+            "left"
+        ].set_linewidth(
+            0.8
+        )
+
+        ax.spines[
+            "bottom"
+        ].set_linewidth(
+            0.8
+        )
+
+        ax.tick_params(
+            axis="both",
+            direction="out",
+            length=3,
+            width=0.8,
+            pad=3,
+            labelsize=tick_fs,
+        )
+
+        # --------------------------------------------------------
+        # Panel letter
+        # --------------------------------------------------------
+        ax.text(
+            -0.25,
+            1.04,
+            panel_letter,
+            transform=ax.transAxes,
+            fontsize=panel_fs,
+            fontweight="bold",
+            ha="left",
+            va="bottom",
+            color="black",
+        )
+
+    # ============================================================
+    # Shared legend — objects only
+    # ============================================================
+    legend_handles = []
+
+    for obj in objects_order:
+
+        legend_handles.append(
+            plt.Line2D(
+                [],
+                [],
+                marker="o",
+                linestyle="-",
+                linewidth=1.4,
+                markersize=5,
+                color=object_palette[obj],
+                alpha=0.75,
+                markeredgecolor="white",
+                markeredgewidth=0.5,
+                label=obj,
+            )
+        )
+
+    # One single row
+    fig.legend(
+        handles=legend_handles,
+        loc="upper center",
+        bbox_to_anchor=(0.5, 0.985),
+        ncol=len(objects_order),
+        frameon=False,
+        fontsize=legend_fs,
+        handlelength=1.6,
+        handletextpad=0.45,
+        columnspacing=1.2,
+    )
+
+    # ============================================================
+    # Save
+    # ============================================================
+    paths = _save_comparison_figure(
+        fig=fig,
+        save_name="beta_sweep_by_object",
+        figures_dir=figures_dir,
+        dpi=dpi,
+        save_png=save_png,
+        save_pdf=save_pdf,
+        save_svg=save_svg,
+    )
+
+    if show:
+        plt.show()
+    else:
+        plt.close(fig)
+
+    return {
+        **paths,
+        "objects": objects_order,
+        "betas": betas.tolist(),
+    }
+
+
+def plot_exploration_balance_exploitation_paired(
+    beta_object_df,
+    softmax_argmax_object_df,
+    exploration_beta=0.5,
+    balance_beta=10.0,
+    objects_order=None,
+    figures_dir=None,
+    figsize=(8.6, 4.6),
+    dpi=600,
+    save_png=True,
+    save_pdf=True,
+    save_svg=True,
+    show=True,
+):
+    """
+    Object-level paired comparison of three attentional regimes:
+
+        Softmax Exploration  -> exploration_beta
+        Softmax Balance      -> balance_beta
+        Argmax Exploitation
+
+    Panels:
+        a) explored object area
+        b) normalised fixation entropy
+
+    Statistical comparisons:
         Exploration vs Balance
         Balance vs Exploitation
 
-    No direct Exploration vs Exploitation test is performed.
-
-    Exact p-values are printed.
-    Only stars are shown on the plot.
+    Exact two-sided paired sign-flip permutation tests are used.
+    Exact p-values are printed; significance stars are shown
+    on the figure.
     """
+    import numpy as np
     import matplotlib.pyplot as plt
 
+    # ============================================================
+    # Validation
+    # ============================================================
+    beta_required = {
+        "object",
+        "beta",
+        "area_explored_coeff",
+        "fixation_entropy_norm",
+    }
+
+    argmax_required = {
+        "object",
+        "mode",
+        "area_explored_coeff",
+        "fixation_entropy_norm",
+    }
+
+    missing_beta = (
+        beta_required
+        - set(beta_object_df.columns)
+    )
+
+    missing_argmax = (
+        argmax_required
+        - set(softmax_argmax_object_df.columns)
+    )
+
+    if missing_beta:
+        raise ValueError(
+            "beta_object_df is missing columns: "
+            + ", ".join(
+                sorted(missing_beta)
+            )
+        )
+
+    if missing_argmax:
+        raise ValueError(
+            "softmax_argmax_object_df is missing columns: "
+            + ", ".join(
+                sorted(missing_argmax)
+            )
+        )
+
+    # ============================================================
+    # Object order
+    # ============================================================
     if objects_order is None:
         objects_order = list(
             dict.fromkeys(
@@ -2823,16 +3637,21 @@ def plot_exploration_balance_exploitation_paired(
             )
         )
 
+    # ============================================================
+    # Extract the three paired conditions
+    # ============================================================
     def get_three_values(metric):
+
+        # --------------------------------------------------------
+        # Softmax exploration
+        # --------------------------------------------------------
         exploration_map = (
             beta_object_df[
                 np.isclose(
                     beta_object_df[
                         "beta"
                     ].astype(float),
-                    float(
-                        exploration_beta
-                    ),
+                    float(exploration_beta),
                 )
             ]
             .set_index("object")[
@@ -2840,15 +3659,16 @@ def plot_exploration_balance_exploitation_paired(
             ]
         )
 
+        # --------------------------------------------------------
+        # Softmax balance
+        # --------------------------------------------------------
         balance_map = (
             beta_object_df[
                 np.isclose(
                     beta_object_df[
                         "beta"
                     ].astype(float),
-                    float(
-                        balance_beta
-                    ),
+                    float(balance_beta),
                 )
             ]
             .set_index("object")[
@@ -2856,44 +3676,49 @@ def plot_exploration_balance_exploitation_paired(
             ]
         )
 
+        # --------------------------------------------------------
+        # Argmax exploitation
+        # --------------------------------------------------------
         exploitation_map = (
             softmax_argmax_object_df[
                 softmax_argmax_object_df[
                     "mode"
-                ] == "argmax"
+                ]
+                .astype(str)
+                .str.lower()
+                == "argmax"
             ]
             .set_index("object")[
                 metric
             ]
         )
 
+        # --------------------------------------------------------
+        # Only objects available in all three conditions
+        # --------------------------------------------------------
         valid_objects = [
             obj
             for obj in objects_order
             if (
-                obj
-                in exploration_map.index
-                and obj
-                in balance_map.index
-                and obj
-                in exploitation_map.index
+                obj in exploration_map.index
+                and obj in balance_map.index
+                and obj in exploitation_map.index
                 and np.isfinite(
-                    exploration_map.loc[
-                        obj
-                    ]
+                    exploration_map.loc[obj]
                 )
                 and np.isfinite(
-                    balance_map.loc[
-                        obj
-                    ]
+                    balance_map.loc[obj]
                 )
                 and np.isfinite(
-                    exploitation_map.loc[
-                        obj
-                    ]
+                    exploitation_map.loc[obj]
                 )
             )
         ]
+
+        if len(valid_objects) == 0:
+            raise RuntimeError(
+                f"No paired objects available for {metric}."
+            )
 
         exploration = np.asarray(
             [
@@ -2926,6 +3751,9 @@ def plot_exploration_balance_exploitation_paired(
             exploitation,
         )
 
+    # ============================================================
+    # Area
+    # ============================================================
     (
         objects_area,
         area_exploration,
@@ -2935,6 +3763,9 @@ def plot_exploration_balance_exploitation_paired(
         "area_explored_coeff"
     )
 
+    # ============================================================
+    # Entropy
+    # ============================================================
     (
         objects_entropy,
         entropy_exploration,
@@ -2950,11 +3781,13 @@ def plot_exploration_balance_exploitation_paired(
             "the same paired objects."
         )
 
-    # ========================================================
-    # Statistics:
-    # only comparisons against intermediate/balance
-    # ========================================================
+    # ============================================================
+    # Statistics
+    # ============================================================
 
+    # ------------------------------------------------------------
+    # Area
+    # ------------------------------------------------------------
     p_area_exploration_balance = (
         exact_sign_flip_test(
             area_exploration,
@@ -2969,6 +3802,9 @@ def plot_exploration_balance_exploitation_paired(
         )
     )
 
+    # ------------------------------------------------------------
+    # Entropy
+    # ------------------------------------------------------------
     p_entropy_exploration_balance = (
         exact_sign_flip_test(
             entropy_exploration,
@@ -2983,24 +3819,27 @@ def plot_exploration_balance_exploitation_paired(
         )
     )
 
-    # ========================================================
+    # ============================================================
     # Print exact p-values
-    # ========================================================
+    # ============================================================
+    print(
+        "Exploration / Balance / Exploitation"
+    )
+
+    print()
 
     print(
         "Explored object area"
     )
 
     print(
-        f"  Exploration vs Balance: "
-        f"p = "
-        f"{p_area_exploration_balance:.5f}"
+        "  Exploration vs Balance: "
+        f"p = {p_area_exploration_balance:.5f}"
     )
 
     print(
-        f"  Balance vs Exploitation: "
-        f"p = "
-        f"{p_area_balance_exploitation:.5f}"
+        "  Balance vs Exploitation: "
+        f"p = {p_area_balance_exploitation:.5f}"
     )
 
     print()
@@ -3010,27 +3849,27 @@ def plot_exploration_balance_exploitation_paired(
     )
 
     print(
-        f"  Exploration vs Balance: "
-        f"p = "
-        f"{p_entropy_exploration_balance:.5f}"
+        "  Exploration vs Balance: "
+        f"p = {p_entropy_exploration_balance:.5f}"
     )
 
     print(
-        f"  Balance vs Exploitation: "
-        f"p = "
-        f"{p_entropy_balance_exploitation:.5f}"
+        "  Balance vs Exploitation: "
+        f"p = {p_entropy_balance_exploitation:.5f}"
     )
 
-    # ========================================================
+    # ============================================================
     # Figure
-    # ========================================================
-
+    # ============================================================
     fig, axes = plt.subplots(
         1,
         2,
         figsize=figsize,
     )
 
+    # ============================================================
+    # Labels
+    # ============================================================
     labels = [
         (
             "Softmax\n"
@@ -3048,68 +3887,100 @@ def plot_exploration_balance_exploitation_paired(
         ),
     ]
 
+    # ============================================================
+    # Colours
+    # ============================================================
     colors = [
         "navy",
         "blueviolet",
         "crimson",
     ]
 
+    # ============================================================
+    # Panel a — explored object area
+    # ============================================================
     _paired_comparison_panel(
         ax=axes[0],
+
         data=[
             area_exploration,
             area_balance,
             area_exploitation,
         ],
+
         labels=labels,
+
         colors=colors,
+
         ylabel=(
             "Explored object area"
         ),
+
+        # Only compare Balance against the two extremes
         comparisons=[
             (0, 1),
             (1, 2),
         ],
+
         pvalues=[
             p_area_exploration_balance,
             p_area_balance_exploitation,
         ],
+
         panel_letter="a",
     )
 
+    # ============================================================
+    # Panel b — fixation entropy
+    # ============================================================
     _paired_comparison_panel(
         ax=axes[1],
+
         data=[
             entropy_exploration,
             entropy_balance,
             entropy_exploitation,
         ],
+
         labels=labels,
+
         colors=colors,
+
         ylabel=(
             "Normalised fixation entropy"
         ),
+
         comparisons=[
             (0, 1),
             (1, 2),
         ],
+
         pvalues=[
             p_entropy_exploration_balance,
             p_entropy_balance_exploitation,
         ],
+
         panel_letter="b",
     )
 
+    # ============================================================
+    # Layout
+    # ============================================================
     fig.tight_layout(
-        w_pad=2.2,
+        w_pad=2.4,
     )
 
+    # ============================================================
+    # Save
+    # ============================================================
     paths = _save_comparison_figure(
         fig=fig,
+
         save_name=(
             "exploration_balance_"
             "exploitation_paired"
         ),
+
         figures_dir=figures_dir,
         dpi=dpi,
         save_png=save_png,
@@ -3117,17 +3988,24 @@ def plot_exploration_balance_exploitation_paired(
         save_svg=save_svg,
     )
 
+    # ============================================================
+    # Show / close
+    # ============================================================
     if show:
         plt.show()
     else:
         plt.close(fig)
 
+    # ============================================================
+    # Return
+    # ============================================================
     return {
         **paths,
 
         "p_area_exploration_balance": (
             p_area_exploration_balance
         ),
+
         "p_area_balance_exploitation": (
             p_area_balance_exploitation
         ),
@@ -3135,314 +4013,10 @@ def plot_exploration_balance_exploitation_paired(
         "p_entropy_exploration_balance": (
             p_entropy_exploration_balance
         ),
+
         "p_entropy_balance_exploitation": (
             p_entropy_balance_exploitation
         ),
 
         "objects": objects_area,
-    }
-
-def plot_beta_sweep_by_object(
-    beta_object_df,
-    objects_order=None,
-    figures_dir=None,
-    figsize=(8.8, 4.3),
-    dpi=600,
-    save_png=True,
-    save_pdf=True,
-    save_svg=True,
-    show=True,
-):
-    """
-    Plot object-level trajectories across the Softmax beta sweep.
-
-    Panels:
-        a) explored object area
-        b) normalised fixation entropy
-
-    Each object receives a different colour from the standard
-    matplotlib tab10 palette.
-    """
-    import matplotlib.pyplot as plt
-
-    # ------------------------------------------------------------
-    # Object order
-    # ------------------------------------------------------------
-    if objects_order is None:
-        objects_order = list(
-            dict.fromkeys(
-                beta_object_df[
-                    "object"
-                ].tolist()
-            )
-        )
-
-    # ------------------------------------------------------------
-    # Validate required columns
-    # ------------------------------------------------------------
-    required_columns = {
-        "object",
-        "beta",
-        "area_explored_coeff",
-        "fixation_entropy_norm",
-    }
-
-    missing = (
-        required_columns
-        - set(beta_object_df.columns)
-    )
-
-    if missing:
-        raise ValueError(
-            "beta_object_df is missing required columns: "
-            + ", ".join(sorted(missing))
-        )
-
-    # ------------------------------------------------------------
-    # Beta values
-    # ------------------------------------------------------------
-    betas = np.sort(
-        beta_object_df[
-            "beta"
-        ].astype(float).unique()
-    )
-
-    # ------------------------------------------------------------
-    # Standard categorical palette
-    # ------------------------------------------------------------
-    cmap = plt.get_cmap("tab10")
-
-    object_colors = {
-        obj: cmap(i % 10)
-        for i, obj in enumerate(
-            objects_order
-        )
-    }
-
-    # ------------------------------------------------------------
-    # Figure
-    # ------------------------------------------------------------
-    fig, axes = plt.subplots(
-        1,
-        2,
-        figsize=figsize,
-    )
-
-    # Space for shared legend at top
-    fig.subplots_adjust(
-        left=0.085,
-        right=0.985,
-        bottom=0.17,
-        top=0.78,
-        wspace=0.30,
-    )
-
-    panel_specs = [
-        (
-            axes[0],
-            "area_explored_coeff",
-            "Explored object area",
-            "a",
-        ),
-        (
-            axes[1],
-            "fixation_entropy_norm",
-            "Normalised fixation entropy",
-            "b",
-        ),
-    ]
-
-    # ------------------------------------------------------------
-    # Plot both metrics
-    # ------------------------------------------------------------
-    for (
-        ax,
-        metric,
-        ylabel,
-        panel_letter,
-    ) in panel_specs:
-
-        for obj in objects_order:
-
-            sub = (
-                beta_object_df[
-                    beta_object_df[
-                        "object"
-                    ] == obj
-                ]
-                .copy()
-                .sort_values("beta")
-            )
-
-            if len(sub) == 0:
-                continue
-
-            x = sub[
-                "beta"
-            ].astype(float).to_numpy()
-
-            y = sub[
-                metric
-            ].astype(float).to_numpy()
-
-            ax.plot(
-                x,
-                y,
-                marker="o",
-                markersize=5.5,
-                linewidth=1.7,
-                color=object_colors[obj],
-                markerfacecolor=object_colors[obj],
-                markeredgecolor="white",
-                markeredgewidth=0.7,
-                alpha=0.90,
-                label=obj,
-                zorder=3,
-            )
-
-        # --------------------------------------------------------
-        # Log beta axis
-        # --------------------------------------------------------
-        ax.set_xscale("log")
-
-        ax.set_xticks(
-            betas
-        )
-
-        ax.set_xticklabels(
-            [
-                f"{beta:g}"
-                for beta in betas
-            ],
-            fontsize=10,
-        )
-
-        ax.set_xlabel(
-            r"Attentional gain $\beta$",
-            fontsize=12,
-            labelpad=6,
-        )
-
-        ax.set_ylabel(
-            ylabel,
-            fontsize=12,
-            labelpad=6,
-        )
-
-        # --------------------------------------------------------
-        # Grey background + white grid
-        # --------------------------------------------------------
-        ax.set_facecolor(
-            "0.90"
-        )
-
-        ax.grid(
-            True,
-            which="major",
-            axis="both",
-            color="white",
-            linewidth=1.1,
-            alpha=1.0,
-            zorder=0,
-        )
-
-        # No minor-grid clutter on log axis
-        ax.grid(
-            False,
-            which="minor",
-        )
-
-        # --------------------------------------------------------
-        # Axis style
-        # --------------------------------------------------------
-        ax.spines[
-            "top"
-        ].set_visible(False)
-
-        ax.spines[
-            "right"
-        ].set_visible(False)
-
-        ax.spines[
-            "left"
-        ].set_color("0.25")
-
-        ax.spines[
-            "bottom"
-        ].set_color("0.25")
-
-        ax.spines[
-            "left"
-        ].set_linewidth(1.0)
-
-        ax.spines[
-            "bottom"
-        ].set_linewidth(1.0)
-
-        ax.tick_params(
-            axis="both",
-            direction="out",
-            length=4,
-            width=1.0,
-            labelsize=10,
-            color="0.25",
-        )
-
-        # --------------------------------------------------------
-        # Panel letter
-        # --------------------------------------------------------
-        ax.text(
-            -0.14,
-            1.03,
-            panel_letter,
-            transform=ax.transAxes,
-            fontsize=14,
-            fontweight="bold",
-            ha="left",
-            va="bottom",
-            color="black",
-        )
-
-    # ------------------------------------------------------------
-    # One shared legend above both panels
-    # ------------------------------------------------------------
-    handles, labels = (
-        axes[0].get_legend_handles_labels()
-    )
-
-    fig.legend(
-        handles,
-        labels,
-        loc="upper center",
-        bbox_to_anchor=(0.5, 0.98),
-        ncol=len(objects_order),
-        frameon=False,
-        fontsize=10,
-        handlelength=1.6,
-        handletextpad=0.5,
-        columnspacing=1.2,
-    )
-
-    # ------------------------------------------------------------
-    # Save
-    # ------------------------------------------------------------
-    paths = _save_comparison_figure(
-        fig=fig,
-        save_name="beta_sweep_by_object",
-        figures_dir=figures_dir,
-        dpi=dpi,
-        save_png=save_png,
-        save_pdf=save_pdf,
-        save_svg=save_svg,
-    )
-
-    if show:
-        plt.show()
-    else:
-        plt.close(fig)
-
-    return {
-        **paths,
-        "objects": objects_order,
-        "betas": betas.tolist(),
     }
